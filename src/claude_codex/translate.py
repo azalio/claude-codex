@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -56,7 +57,7 @@ def _flush_pending(result: list[dict[str, Any]], role: str, pending: list[dict[s
 def _lower_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for message in messages:
-        role = message.get("role")
+        role = str(message.get("role") or "user")
         content = message.get("content", "")
         if isinstance(content, str):
             item_type = "output_text" if role == "assistant" else "input_text"
@@ -116,7 +117,74 @@ def _tool_choice(value: Any) -> Any:
     return "auto"
 
 
-def to_responses_request(payload: dict[str, Any], *, model: str, reasoning_effort: str) -> dict[str, Any]:
+def validate_messages_request(payload: Any, *, require_messages: bool = True) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Request body must be a JSON object")
+    system = payload.get("system")
+    if system is not None:
+        if not isinstance(system, (str, list)):
+            raise ValueError("system must be a string or an array")
+        if isinstance(system, list) and not all(isinstance(block, dict) for block in system):
+            raise ValueError("each system block must be an object")
+    messages = payload.get("messages")
+    if require_messages and not isinstance(messages, list):
+        raise ValueError("messages must be an array")
+    if messages is not None:
+        if not isinstance(messages, list):
+            raise ValueError("messages must be an array")
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError("each message must be an object")
+            # Claude Code emits `system`/`developer` turns inside `messages`
+            # (not just top-level `system`), and the Codex Responses API
+            # accepts them, so mirror that set instead of only user/assistant.
+            if message.get("role") not in {"user", "assistant", "system", "developer"}:
+                raise ValueError("message role must be user, assistant, system, or developer")
+            content = message.get("content", "")
+            if not isinstance(content, (str, list)):
+                raise ValueError("message content must be a string or an array")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        raise ValueError("each content block must be an object")
+                    if block.get("type") == "image" and not isinstance(block.get("source"), dict):
+                        raise ValueError("image source must be an object")
+                    if block.get("type") == "tool_result":
+                        result_content = block.get("content", "")
+                        if not isinstance(result_content, (str, list)):
+                            raise ValueError("tool result content must be a string or an array")
+                        if isinstance(result_content, list) and not all(
+                            isinstance(item, dict) for item in result_content
+                        ):
+                            raise ValueError("each tool result content block must be an object")
+    tools = payload.get("tools")
+    if tools is not None and (
+        not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools)
+    ):
+        raise ValueError("tools must be an array of objects")
+    max_tokens = payload.get("max_tokens")
+    if max_tokens is not None and (
+        isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0
+    ):
+        raise ValueError("max_tokens must be a positive integer")
+    if "stream" in payload and not isinstance(payload["stream"], bool):
+        raise ValueError("stream must be a boolean")
+    return payload
+
+
+def _bounded_cache_key(value: str) -> str:
+    if len(value) <= 64:
+        return value
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def to_responses_request(
+    payload: dict[str, Any],
+    *,
+    model: str,
+    reasoning_effort: str,
+    prompt_cache_key: str | None = None,
+) -> dict[str, Any]:
     system = _text(payload.get("system"))
     tools = [
         {
@@ -138,10 +206,19 @@ def to_responses_request(payload: dict[str, Any], *, model: str, reasoning_effor
         "include": ["reasoning.encrypted_content"],
         "reasoning": {"effort": reasoning_effort, "summary": "auto"},
     }
+    if prompt_cache_key:
+        request["prompt_cache_key"] = _bounded_cache_key(prompt_cache_key)
+    # NB: the Codex `/responses` backend rejects `max_output_tokens`
+    # ("Unsupported parameter") and manages output length itself, so the
+    # Anthropic `max_tokens` is validated on the way in but not forwarded.
     if tools:
+        tool_choice = payload.get("tool_choice")
         request["tools"] = tools
-        request["tool_choice"] = _tool_choice(payload.get("tool_choice"))
-        request["parallel_tool_calls"] = not bool(payload.get("disable_parallel_tool_use"))
+        request["tool_choice"] = _tool_choice(tool_choice)
+        disable_parallel = (
+            bool(tool_choice.get("disable_parallel_tool_use")) if isinstance(tool_choice, dict) else False
+        )
+        request["parallel_tool_calls"] = not disable_parallel
     return request
 
 
@@ -157,20 +234,40 @@ class Block:
     name: str | None = None
     text: str = ""
     arguments: str = ""
+    arguments_seen: bool = False
     open: bool = True
 
 
 @dataclass(slots=True)
 class AnthropicStream:
     requested_model: str
+    retain_content: bool = True
     response_id: str = field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
     started: bool = False
     completed: bool = False
+    failed: bool = False
+    failure_message: str | None = None
+    stop_reason: str | None = None
     has_tool: bool = False
     blocks: list[Block] = field(default_factory=list)
     by_output: dict[int, Block] = field(default_factory=dict)
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+
+    def _usage(self) -> dict[str, int]:
+        cache_read = max(0, int(getattr(self, "cache_read_input_tokens", 0)))
+        cache_creation = max(0, int(getattr(self, "cache_creation_input_tokens", 0)))
+        usage = {
+            "input_tokens": max(0, self.input_tokens - cache_read - cache_creation),
+            "output_tokens": self.output_tokens,
+        }
+        if cache_read:
+            usage["cache_read_input_tokens"] = cache_read
+        if cache_creation:
+            usage["cache_creation_input_tokens"] = cache_creation
+        return usage
 
     def _start(self) -> list[tuple[str, dict[str, Any]]]:
         if self.started:
@@ -237,18 +334,24 @@ class AnthropicStream:
             return output
         if event in {"error", "response.failed"}:
             error = data.get("error") or (data.get("response") or {}).get("error") or {}
+            self.failed = True
+            self.completed = True
+            self.failure_message = (
+                str(error.get("message") or "Codex request failed")
+                if isinstance(error, dict)
+                else "Codex request failed"
+            )
             return [
                 (
                     "error",
                     {
                         "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": error.get("message") or "Codex request failed",
-                        },
+                        "error": {"type": "api_error", "message": self.failure_message},
                     },
                 )
             ]
+        if self.completed:
+            return []
         output.extend(self._start())
         output_index = int(data.get("output_index") or 0)
         if event == "response.output_item.added":
@@ -261,7 +364,8 @@ class AnthropicStream:
             block, opened = self._block(output_index, "text")
             output.extend(opened)
             delta = str(data.get("delta") or "")
-            block.text += delta
+            if self.retain_content:
+                block.text += delta
             if delta:
                 output.append(
                     (
@@ -279,8 +383,10 @@ class AnthropicStream:
             block, opened = self._block(output_index, "tool", item)
             output.extend(opened)
             delta = str(data.get("delta") or "")
-            block.arguments += delta
             if delta:
+                block.arguments_seen = True
+                if self.retain_content:
+                    block.arguments += delta
                 output.append(
                     (
                         "content_block_delta",
@@ -299,8 +405,10 @@ class AnthropicStream:
                 block, opened = self._block(output_index, "tool", item)
                 output.extend(opened)
                 arguments = str(item.get("arguments") or "")
-                if arguments and not block.arguments:
-                    block.arguments = arguments
+                if arguments and not block.arguments_seen:
+                    block.arguments_seen = True
+                    if self.retain_content:
+                        block.arguments = arguments
                     output.append(
                         (
                             "content_block_delta",
@@ -315,12 +423,19 @@ class AnthropicStream:
                 block.open = False
                 output.append(("content_block_stop", {"type": "content_block_stop", "index": block.index}))
             return output
-        if event == "response.completed":
+        if event in {"response.completed", "response.incomplete"}:
             response = data.get("response") or {}
             usage = response.get("usage") or {}
             self.input_tokens = int(usage.get("input_tokens") or 0)
             self.output_tokens = int(usage.get("output_tokens") or 0)
-            output.extend(self.finish(response.get("incomplete_details")))
+            details = usage.get("input_tokens_details") or {}
+            if isinstance(details, dict):
+                self.cache_read_input_tokens = int(details.get("cached_tokens") or 0)
+                self.cache_creation_input_tokens = int(details.get("cache_write_tokens") or 0)
+            incomplete = response.get("incomplete_details")
+            if event == "response.incomplete" and not incomplete:
+                incomplete = {"reason": "max_output_tokens"}
+            output.extend(self.finish(incomplete))
         return output
 
     def finish(self, incomplete: dict[str, Any] | None = None) -> list[tuple[str, dict[str, Any]]]:
@@ -334,6 +449,7 @@ class AnthropicStream:
         reason = "tool_use" if self.has_tool else "end_turn"
         if incomplete and incomplete.get("reason") == "max_output_tokens":
             reason = "max_tokens"
+        self.stop_reason = reason
         output.extend(
             [
                 (
@@ -341,7 +457,7 @@ class AnthropicStream:
                     {
                         "type": "message_delta",
                         "delta": {"stop_reason": reason, "stop_sequence": None},
-                        "usage": {"output_tokens": self.output_tokens},
+                        "usage": self._usage(),
                     },
                 ),
                 ("message_stop", {"type": "message_stop"}),
@@ -351,6 +467,8 @@ class AnthropicStream:
         return output
 
     def response(self) -> dict[str, Any]:
+        if self.failed:
+            raise RuntimeError(self.failure_message or "Codex request failed")
         content: list[dict[str, Any]] = []
         for block in self.blocks:
             if block.kind == "text":
@@ -369,9 +487,9 @@ class AnthropicStream:
             "role": "assistant",
             "model": self.requested_model,
             "content": content,
-            "stop_reason": "tool_use" if self.has_tool else "end_turn",
+            "stop_reason": self.stop_reason or ("tool_use" if self.has_tool else "end_turn"),
             "stop_sequence": None,
-            "usage": {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens},
+            "usage": self._usage(),
         }
 
 

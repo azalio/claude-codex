@@ -42,12 +42,12 @@ class Response:
         return json.dumps({"startup_id": self.startup_id}).encode()
 
 
-def test_gpt_5_6_uses_1m_claude_context_identity() -> None:
+def test_gpt_5_6_uses_standard_claude_context_identity() -> None:
     env: dict[str, str] = {}
 
     result = launcher._configure_context_identity(env, "gpt-5.6-sol")
 
-    assert result == "claude-opus-4-8[1m]"
+    assert result == "claude-opus-4-8"
     assert env["ANTHROPIC_MODEL"] == result
 
 
@@ -60,7 +60,7 @@ def test_context_identity_preserves_explicit_model() -> None:
     assert env["ANTHROPIC_MODEL"] == "claude-custom"
 
 
-def test_other_upstream_models_do_not_claim_1m_context() -> None:
+def test_other_upstream_models_do_not_set_claude_context_identity() -> None:
     env: dict[str, str] = {}
 
     assert launcher._configure_context_identity(env, "gpt-5.4") is None

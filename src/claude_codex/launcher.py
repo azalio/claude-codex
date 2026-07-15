@@ -64,7 +64,7 @@ def _configure_context_identity(env: dict[str, str], model: str) -> str | None:
     if explicit:
         return explicit
     if model == "gpt-5.6" or model.startswith("gpt-5.6-"):
-        env["ANTHROPIC_MODEL"] = "claude-opus-4-8[1m]"
+        env["ANTHROPIC_MODEL"] = "claude-opus-4-8"
         return env["ANTHROPIC_MODEL"]
     return None
 

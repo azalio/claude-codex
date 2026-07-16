@@ -8,11 +8,15 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import uuid
 from contextlib import suppress
 from pathlib import Path
+from typing import BinaryIO
+
+DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
 
 
 def _listen_socket(port: int = 0) -> socket.socket:
@@ -69,6 +73,46 @@ def _configure_context_identity(env: dict[str, str], model: str) -> str | None:
     return None
 
 
+def _log_max_bytes() -> int:
+    raw = os.environ.get("CLAUDE_CODEX_LOG_MAX_BYTES")
+    try:
+        limit = int(raw) if raw is not None else DEFAULT_LOG_MAX_BYTES
+    except ValueError:
+        return DEFAULT_LOG_MAX_BYTES
+    return limit if limit > 0 else DEFAULT_LOG_MAX_BYTES
+
+
+def _append_rotated_log(log_path: Path, data: bytes, *, max_bytes: int) -> None:
+    if max_bytes < 1:
+        return
+    while data:
+        try:
+            size = log_path.stat().st_size
+        except FileNotFoundError:
+            size = 0
+        except OSError:
+            return
+        if size >= max_bytes:
+            try:
+                log_path.replace(log_path.with_name(f"{log_path.name}.1"))
+            except (FileNotFoundError, OSError):
+                return
+            size = 0
+        chunk_size = min(max_bytes - size, len(data))
+        try:
+            with log_path.open("ab") as log:
+                log.write(data[:chunk_size])
+        except OSError:
+            return
+        data = data[chunk_size:]
+
+
+def _drain_proxy_output(source: BinaryIO, log_path: Path, *, max_bytes: int) -> None:
+    with source:
+        while chunk := source.read1(8192):
+            _append_rotated_log(log_path, chunk, max_bytes=max_bytes)
+
+
 def main() -> None:
     claude = shutil.which("claude")
     if not claude:
@@ -78,7 +122,7 @@ def main() -> None:
     state = Path.home() / ".local" / "state" / "claude-codex"
     state.mkdir(parents=True, exist_ok=True)
     log_path = state / "proxy.log"
-    log = log_path.open("a")
+    log_max_bytes = _log_max_bytes()
     startup_id = uuid.uuid4().hex
     try:
         proxy = subprocess.Popen(
@@ -91,16 +135,23 @@ def main() -> None:
                 "--startup-id",
                 startup_id,
             ],
-            stdout=log,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
             pass_fds=(listener.fileno(),),
         )
-    except BaseException:
-        log.close()
-        raise
     finally:
         listener.close()
+    if proxy.stdout is None:
+        _terminate(proxy)
+        raise RuntimeError("Proxy stdout pipe was not created")
+    log_thread = threading.Thread(
+        target=_drain_proxy_output,
+        args=(proxy.stdout, log_path),
+        kwargs={"max_bytes": log_max_bytes},
+        daemon=True,
+    )
+    log_thread.start()
     # Backstop: guarantees teardown even if the finally below is bypassed.
     atexit.register(_terminate, proxy)
     try:
@@ -125,7 +176,7 @@ def main() -> None:
         raise SystemExit(result.returncode)
     finally:
         _terminate(proxy)
-        log.close()
+        log_thread.join(timeout=1)
 
 
 if __name__ == "__main__":

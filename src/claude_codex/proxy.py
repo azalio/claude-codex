@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
 import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -25,10 +27,29 @@ from .translate import (
 )
 
 CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
+INSTALLATION_ID_PATH = Path.home() / ".config" / "claude-codex" / "installation_id"
 
 # Emit an SSE `ping` at least this often so a client never sees a silent stream
 # (e.g. during long model reasoning) and time the connection out.
 PING_INTERVAL_SECONDS = 15.0
+
+
+def _resolve_installation_id(path: Path) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            return str(uuid.UUID(path.read_text().strip()))
+        except (OSError, ValueError):
+            installation_id = str(uuid.uuid4())
+            path.write_text(installation_id + "\n")
+            path.chmod(0o600)
+            return installation_id
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +102,41 @@ def _stream_error(exc: Exception) -> dict[str, Any]:
     else:
         kind = "api_error"
     return {"type": "error", "error": {"type": kind, "message": str(exc)}}
+
+
+def _log_upstream_cache_usage(event: str, data: dict[str, Any]) -> None:
+    """Write cache usage reported by the upstream Responses event to proxy.log."""
+    if event not in {"response.completed", "response.incomplete"}:
+        return
+    response = data.get("response")
+    if not isinstance(response, dict):
+        return
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return
+    details = usage.get("input_tokens_details")
+    if not isinstance(details, dict):
+        details = {}
+    try:
+        input_tokens = max(0, int(usage.get("input_tokens") or 0))
+        cached_tokens = max(0, int(details.get("cached_tokens") or 0))
+    except (TypeError, ValueError):
+        return
+    cache_write = details.get("cache_write_tokens")
+    if cache_write is None:
+        cache_write_tokens = "unreported"
+    else:
+        try:
+            cache_write_tokens = str(max(0, int(cache_write)))
+        except (TypeError, ValueError):
+            cache_write_tokens = "unreported"
+    result = "hit" if cached_tokens else "miss"
+    print(
+        "codex_cache "
+        f"source=upstream result={result} input_tokens={input_tokens} "
+        f"cached_tokens={cached_tokens} cache_write_tokens={cache_write_tokens}",
+        flush=True,
+    )
 
 
 async def _sse(response: httpx.Response) -> AsyncIterator[tuple[str, dict[str, Any]]]:
@@ -141,8 +197,9 @@ class CodexBackend:
                 if response.is_error:
                     body = (await response.aread()).decode(errors="replace")
                     raise BackendError(response.status_code, body[:500], response.headers.get("retry-after"))
-                async for event in _sse(response):
-                    yield event
+                async for event, data in _sse(response):
+                    _log_upstream_cache_usage(event, data)
+                    yield event, data
                 return
 
 
@@ -152,6 +209,7 @@ def create_app(
     client: httpx.AsyncClient | None = None,
     endpoint: str | None = None,
     startup_id: str | None = None,
+    installation_id_path: Path | None = None,
 ) -> FastAPI:
     owns_client = client is None
     http = client or httpx.AsyncClient(timeout=httpx.Timeout(300, connect=30))
@@ -161,7 +219,7 @@ def create_app(
         http,
         endpoint or os.environ.get("CLAUDE_CODEX_ENDPOINT", CODEX_ENDPOINT),
     )
-    installation_id = str(uuid.uuid4())
+    installation_id = _resolve_installation_id(installation_id_path or INSTALLATION_ID_PATH)
     session_identities: dict[str, CodexRequestIdentity] = {}
 
     def identity_for(session_id: str) -> CodexRequestIdentity:
@@ -293,6 +351,7 @@ def create_app(
                 task = asyncio.create_task(pump())
                 error: Exception | None = None
                 completed = False
+                cancelled = False
                 try:
                     while True:
                         try:
@@ -314,10 +373,17 @@ def create_app(
                             break
                         for name, chunk in translated:
                             yield encode_sse(name, chunk)
+                except asyncio.CancelledError:
+                    # Launcher shutdown и disconnect клиента отменяют response task.
+                    # Upstream task очищается ниже; штатное завершение не должно
+                    # превращаться в ASGI traceback.
+                    cancelled = True
                 finally:
                     task.cancel()
                     with suppress(BaseException):
                         await task
+                if cancelled:
+                    return
                 if error is not None:
                     yield encode_sse("error", _stream_error(error))
                 elif completed:
@@ -345,6 +411,7 @@ def main() -> None:
     parser.add_argument("--fd", type=int)
     parser.add_argument("--startup-id")
     args = parser.parse_args()
+    print(f"proxy_started startup_id={args.startup_id or 'unknown'}", flush=True)
     uvicorn.run(
         create_app(startup_id=args.startup_id),
         host=args.host,

@@ -132,9 +132,11 @@ OpenCode and Codex credential files are read-only inputs. Refreshed credentials 
   the private `claude-codex` cache.
 - **Session isolation:** each launcher run creates a UUID session header and owns its local proxy
   process lifecycle.
+- **Installation identity:** the upstream `x-codex-installation-id` is a persistent, proxy-owned
+  UUID stored at `~/.config/claude-codex/installation_id`; it is distinct from Codex CLI's own ID.
 - **Backend configurability:** `CLAUDE_CODEX_MODEL`, `CLAUDE_CODEX_REASONING`,
-  `CLAUDE_CODEX_ENDPOINT`, `CLAUDE_CODEX_PORT`, `CLAUDE_CODEX_AUTH_FILE`, and
-  `CLAUDE_CODEX_BIN_DIR` control runtime or install behavior.
+  `CLAUDE_CODEX_ENDPOINT`, `CLAUDE_CODEX_PORT`, `CLAUDE_CODEX_AUTH_FILE`,
+  `CLAUDE_CODEX_LOG_MAX_BYTES`, and `CLAUDE_CODEX_BIN_DIR` control runtime or install behavior.
 
 ## Deployment/Operations
 
@@ -145,9 +147,10 @@ This is a local CLI tool, not a service deployment. Operational setup is:
 - Ensure `~/bin` is on `PATH`.
 - Run `claude-codex` with the same arguments normally passed to `claude`.
 
-The launcher writes proxy output to `~/.local/state/claude-codex/proxy.log`. The proxy listens on
-loopback only by default. Tests run with `pytest`; lint rules are configured through Ruff in
-`pyproject.toml`.
+The launcher writes proxy output to `~/.local/state/claude-codex/proxy.log` and rotates it to one
+`proxy.log.1` backup at 10 MiB by default (override with a positive
+`CLAUDE_CODEX_LOG_MAX_BYTES` byte value). The proxy listens on loopback only by default. Tests run
+with `pytest`; lint rules are configured through Ruff in `pyproject.toml`.
 
 ## Known Risks/Gaps
 

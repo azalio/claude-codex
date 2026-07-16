@@ -3,11 +3,18 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from pathlib import Path
 
 import httpx
+import pytest
 
 from claude_codex.auth import Tokens
 from claude_codex.proxy import create_app
+
+
+@pytest.fixture(autouse=True)
+def isolated_installation_id(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("claude_codex.proxy.INSTALLATION_ID_PATH", tmp_path / "installation_id")
 
 
 class FakeAuth:
@@ -82,6 +89,43 @@ async def test_proxy_streams_anthropic_events(monkeypatch) -> None:
     }
     assert "max_output_tokens" not in captured["body"]
     assert captured["body"]["input"][0]["content"][0]["text"] == "hi"
+    await upstream_client.aclose()
+
+
+async def test_proxy_reuses_persistent_installation_id_across_app_lifetimes(tmp_path: Path) -> None:
+    installation_id_path = tmp_path / "installation_id"
+    installations: list[str] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        installations.append(request.headers["x-codex-installation-id"])
+        event = {
+            "type": "response.completed",
+            "response": {"usage": {"input_tokens": 1, "output_tokens": 1}},
+        }
+        return httpx.Response(
+            200,
+            text=f"event: response.completed\ndata: {json.dumps(event)}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    for _ in range(2):
+        app = create_app(
+            auth=FakeAuth(),
+            client=upstream_client,
+            endpoint="https://codex.test/responses",
+            installation_id_path=installation_id_path,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post(
+                "/v1/messages",
+                json={"model": "claude-opus", "max_tokens": 10, "messages": []},
+            )
+        assert response.status_code == 200
+
+    assert installations == [installation_id_path.read_text().strip()] * 2
     await upstream_client.aclose()
 
 
@@ -176,7 +220,7 @@ async def test_proxy_reuses_complete_codex_cache_identity_for_claude_session() -
     await upstream_client.aclose()
 
 
-async def test_nonstream_surfaces_cached_input_usage() -> None:
+async def test_nonstream_surfaces_cached_input_usage(capsys) -> None:
     async def upstream(_: httpx.Request) -> httpx.Response:
         events = [
             {"type": "response.created", "response": {"id": "resp_test"}},
@@ -185,9 +229,9 @@ async def test_nonstream_surfaces_cached_input_usage() -> None:
                 "response": {
                     "usage": {
                         "input_tokens": 4096,
-                        "input_tokens_details": {"cached_tokens": 3072},
+                        "input_tokens_details": {"cached_tokens": 3072, "cache_write_tokens": 1024},
                         "output_tokens": 2,
-                    }
+                    },
                 },
             },
         ]
@@ -209,10 +253,56 @@ async def test_nonstream_surfaces_cached_input_usage() -> None:
 
     assert response.status_code == 200
     assert response.json()["usage"] == {
+        "input_tokens": 0,
+        "cache_read_input_tokens": 3072,
+        "cache_creation_input_tokens": 1024,
+        "output_tokens": 2,
+    }
+    assert capsys.readouterr().out == (
+        "codex_cache source=upstream result=hit input_tokens=4096 "
+        "cached_tokens=3072 cache_write_tokens=1024\n"
+    )
+    await upstream_client.aclose()
+
+
+async def test_nonstream_marks_unreported_cache_write_usage(capsys) -> None:
+    async def upstream(_: httpx.Request) -> httpx.Response:
+        event = {
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 4096,
+                    "input_tokens_details": {"cached_tokens": 3072},
+                    "output_tokens": 2,
+                }
+            },
+        }
+        return httpx.Response(
+            200,
+            text=f"event: response.completed\ndata: {json.dumps(event)}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    app = create_app(auth=FakeAuth(), client=upstream_client, endpoint="https://codex.test/responses")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+    ) as client:
+        response = await client.post(
+            "/v1/messages",
+            json={"model": "claude-opus", "max_tokens": 10, "messages": []},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["usage"] == {
         "input_tokens": 1024,
         "cache_read_input_tokens": 3072,
         "output_tokens": 2,
     }
+    assert capsys.readouterr().out == (
+        "codex_cache source=upstream result=hit input_tokens=4096 "
+        "cached_tokens=3072 cache_write_tokens=unreported\n"
+    )
     await upstream_client.aclose()
 
 

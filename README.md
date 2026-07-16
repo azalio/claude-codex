@@ -47,7 +47,11 @@ Configuration:
 ```bash
 CLAUDE_CODEX_MODEL=gpt-5.6-sol claude-codex
 CLAUDE_CODEX_REASONING=high claude-codex
+CLAUDE_CODEX_LOG_MAX_BYTES=10485760 claude-codex
 ```
+
+`proxy.log` is rotated to one `proxy.log.1` backup when it reaches 10 MiB. Set
+`CLAUDE_CODEX_LOG_MAX_BYTES` to a positive byte limit to override that threshold.
 
 The backend URL is an internal ChatGPT Codex contract also used by OpenCode. It can change without
 the compatibility guarantees of the public OpenAI Platform API.

@@ -13,8 +13,10 @@ from claude_codex.proxy import create_app
 
 
 @pytest.fixture(autouse=True)
-def isolated_installation_id(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("claude_codex.proxy.INSTALLATION_ID_PATH", tmp_path / "installation_id")
+def isolated_installation_id(monkeypatch, tmp_path: Path) -> Path:
+    path = tmp_path / "installation_id"
+    monkeypatch.setattr("claude_codex.proxy.INSTALLATION_ID_PATH", path)
+    return path
 
 
 class FakeAuth:
@@ -129,6 +131,47 @@ async def test_proxy_reuses_persistent_installation_id_across_app_lifetimes(tmp_
     await upstream_client.aclose()
 
 
+async def test_proxy_prefers_native_session_over_launcher_session() -> None:
+    captured: list[dict[str, object]] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured.append(
+            {
+                "session": request.headers["session-id"],
+                "thread": request.headers["thread-id"],
+                "cache_key": body["prompt_cache_key"],
+            }
+        )
+        event = {
+            "type": "response.completed",
+            "response": {"usage": {"input_tokens": 1, "output_tokens": 1}},
+        }
+        return httpx.Response(
+            200,
+            text=f"event: response.completed\ndata: {json.dumps(event)}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    app = create_app(auth=FakeAuth(), client=upstream_client, endpoint="https://codex.test/responses")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+    ) as client:
+        for native_session in ("native-a", "native-b"):
+            response = await client.post(
+                "/v1/messages",
+                headers={"x-session-id": "launcher-session", "anthropic-session-id": native_session},
+                json={"model": "claude-opus", "max_tokens": 10, "messages": []},
+            )
+            assert response.status_code == 200
+
+    assert [entry["session"] for entry in captured] == ["native-a", "native-b"]
+    assert [entry["cache_key"] for entry in captured] == ["native-a", "native-b"]
+    assert captured[0]["thread"] != captured[1]["thread"]
+    await upstream_client.aclose()
+
+
 async def test_proxy_reuses_complete_codex_cache_identity_for_claude_session() -> None:
     """A follow-up must carry the whole Codex cache-routing contract.
 
@@ -220,7 +263,7 @@ async def test_proxy_reuses_complete_codex_cache_identity_for_claude_session() -
     await upstream_client.aclose()
 
 
-async def test_nonstream_surfaces_cached_input_usage(capsys) -> None:
+async def test_nonstream_surfaces_cached_input_usage(capsys, isolated_installation_id: Path) -> None:
     async def upstream(_: httpx.Request) -> httpx.Response:
         events = [
             {"type": "response.created", "response": {"id": "resp_test"}},
@@ -259,13 +302,15 @@ async def test_nonstream_surfaces_cached_input_usage(capsys) -> None:
         "output_tokens": 2,
     }
     assert capsys.readouterr().out == (
-        "codex_cache source=upstream result=hit input_tokens=4096 "
+        "codex_cache source=upstream "
+        f"client_id={isolated_installation_id.read_text().strip()} "
+        "session_source=default session_id=claude-codex result=hit input_tokens=4096 "
         "cached_tokens=3072 cache_write_tokens=1024\n"
     )
     await upstream_client.aclose()
 
 
-async def test_nonstream_marks_unreported_cache_write_usage(capsys) -> None:
+async def test_nonstream_marks_unreported_cache_write_usage(capsys, isolated_installation_id: Path) -> None:
     async def upstream(_: httpx.Request) -> httpx.Response:
         event = {
             "type": "response.completed",
@@ -300,7 +345,9 @@ async def test_nonstream_marks_unreported_cache_write_usage(capsys) -> None:
         "output_tokens": 2,
     }
     assert capsys.readouterr().out == (
-        "codex_cache source=upstream result=hit input_tokens=4096 "
+        "codex_cache source=upstream "
+        f"client_id={isolated_installation_id.read_text().strip()} "
+        "session_source=default session_id=claude-codex result=hit input_tokens=4096 "
         "cached_tokens=3072 cache_write_tokens=unreported\n"
     )
     await upstream_client.aclose()

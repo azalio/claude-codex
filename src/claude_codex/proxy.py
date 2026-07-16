@@ -63,6 +63,7 @@ class CodexRequestIdentity:
 
     installation_id: str
     session_id: str
+    session_source: str
     thread_id: str
     window_id: str
 
@@ -104,7 +105,7 @@ def _stream_error(exc: Exception) -> dict[str, Any]:
     return {"type": "error", "error": {"type": kind, "message": str(exc)}}
 
 
-def _log_upstream_cache_usage(event: str, data: dict[str, Any]) -> None:
+def _log_upstream_cache_usage(event: str, data: dict[str, Any], identity: CodexRequestIdentity) -> None:
     """Write cache usage reported by the upstream Responses event to proxy.log."""
     if event not in {"response.completed", "response.incomplete"}:
         return
@@ -133,7 +134,8 @@ def _log_upstream_cache_usage(event: str, data: dict[str, Any]) -> None:
     result = "hit" if cached_tokens else "miss"
     print(
         "codex_cache "
-        f"source=upstream result={result} input_tokens={input_tokens} "
+        f"source=upstream client_id={identity.installation_id} session_source={identity.session_source} "
+        f"session_id={identity.session_id} result={result} input_tokens={input_tokens} "
         f"cached_tokens={cached_tokens} cache_write_tokens={cache_write_tokens}",
         flush=True,
     )
@@ -198,7 +200,7 @@ class CodexBackend:
                     body = (await response.aread()).decode(errors="replace")
                     raise BackendError(response.status_code, body[:500], response.headers.get("retry-after"))
                 async for event, data in _sse(response):
-                    _log_upstream_cache_usage(event, data)
+                    _log_upstream_cache_usage(event, data, identity)
                     yield event, data
                 return
 
@@ -220,19 +222,27 @@ def create_app(
         endpoint or os.environ.get("CLAUDE_CODEX_ENDPOINT", CODEX_ENDPOINT),
     )
     installation_id = _resolve_installation_id(installation_id_path or INSTALLATION_ID_PATH)
-    session_identities: dict[str, CodexRequestIdentity] = {}
+    session_identities: dict[tuple[str, str], CodexRequestIdentity] = {}
 
-    def identity_for(session_id: str) -> CodexRequestIdentity:
-        identity = session_identities.get(session_id)
+    def identity_for(session_source: str, session_id: str) -> CodexRequestIdentity:
+        key = (session_source, session_id)
+        identity = session_identities.get(key)
         if identity is None:
             identity = CodexRequestIdentity(
                 installation_id=installation_id,
                 session_id=session_id,
+                session_source=session_source,
                 thread_id=str(uuid.uuid4()),
                 window_id=str(uuid.uuid4()),
             )
-            session_identities[session_id] = identity
+            session_identities[key] = identity
         return identity
+
+    def request_session_identity(request: Request) -> tuple[str, str]:
+        for header in ("anthropic-session-id", "session-id", "x-session-id"):
+            if value := request.headers.get(header):
+                return header, value
+        return "default", "claude-codex"
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -309,12 +319,8 @@ def create_app(
         requested_model = str(body.get("model") or "claude-codex")
         codex_model = os.environ.get("CLAUDE_CODEX_MODEL", "gpt-5.6-sol")
         reasoning = os.environ.get("CLAUDE_CODEX_REASONING", "medium")
-        session_id = (
-            request.headers.get("x-session-id")
-            or request.headers.get("session-id")
-            or request.headers.get("anthropic-session-id", "claude-codex")
-        )
-        identity = identity_for(session_id)
+        session_source, session_id = request_session_identity(request)
+        identity = identity_for(session_source, session_id)
         upstream = to_responses_request(
             body,
             model=codex_model,

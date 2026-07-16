@@ -27,6 +27,10 @@ async def test_proxy_streams_anthropic_events(monkeypatch) -> None:
         captured["url"] = str(request.url)
         captured["account"] = request.headers.get("ChatGPT-Account-Id")
         captured["session"] = request.headers.get("session-id")
+        captured["thread"] = request.headers.get("thread-id")
+        captured["installation"] = request.headers.get("x-codex-installation-id")
+        captured["window"] = request.headers.get("x-codex-window-id")
+        captured["originator"] = request.headers.get("originator")
         captured["body"] = json.loads(request.content)
         events = [
             {"type": "response.created", "response": {"id": "resp_test"}},
@@ -64,10 +68,111 @@ async def test_proxy_streams_anthropic_events(monkeypatch) -> None:
     assert captured["url"] == "https://codex.test/responses"
     assert captured["account"] == "acc-123"
     assert captured["session"] == "session-test"
+    assert captured["originator"] == "codex_cli_rs"
+    assert captured["thread"]
+    assert captured["installation"]
+    assert captured["window"]
     assert captured["body"]["model"] == "gpt-5.6-sol"
     assert captured["body"]["prompt_cache_key"] == "session-test"
+    assert captured["body"]["client_metadata"] == {
+        "x-codex-installation-id": captured["installation"],
+        "session_id": captured["session"],
+        "thread_id": captured["thread"],
+        "x-codex-window-id": captured["window"],
+    }
     assert "max_output_tokens" not in captured["body"]
     assert captured["body"]["input"][0]["content"][0]["text"] == "hi"
+    await upstream_client.aclose()
+
+
+async def test_proxy_reuses_complete_codex_cache_identity_for_claude_session() -> None:
+    """A follow-up must carry the whole Codex cache-routing contract.
+
+    The backend cache is scoped by more than ``prompt_cache_key``. Model its
+    routing key here so a regression in any identity header/body field turns
+    the second request into a miss.
+    """
+
+    captured: list[dict[str, object]] = []
+    warmed_cache_keys: set[tuple[str, ...]] = set()
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        headers = {
+            name: request.headers[name]
+            for name in (
+                "originator",
+                "user-agent",
+                "x-codex-installation-id",
+                "session-id",
+                "thread-id",
+                "x-client-request-id",
+                "x-codex-window-id",
+            )
+        }
+        body = json.loads(request.content)
+        assert headers["originator"] == "codex_cli_rs"
+        assert headers["user-agent"].startswith("Codex/")
+        assert headers["x-client-request-id"] == headers["thread-id"]
+        assert body["prompt_cache_key"] == headers["session-id"]
+        assert body["client_metadata"] == {
+            "x-codex-installation-id": headers["x-codex-installation-id"],
+            "session_id": headers["session-id"],
+            "thread_id": headers["thread-id"],
+            "x-codex-window-id": headers["x-codex-window-id"],
+        }
+
+        cache_key = (*headers.values(), body["prompt_cache_key"])
+        cached_tokens = 3072 if cache_key in warmed_cache_keys else 0
+        warmed_cache_keys.add(cache_key)
+        captured.append({"headers": headers, "body": body})
+        event = {
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 4096,
+                    "input_tokens_details": {"cached_tokens": cached_tokens},
+                    "output_tokens": 1,
+                }
+            },
+        }
+        return httpx.Response(
+            200,
+            text=f"event: response.completed\ndata: {json.dumps(event)}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    app = create_app(auth=FakeAuth(), client=upstream_client, endpoint="https://codex.test/responses")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+    ) as client:
+        responses = []
+        for session_id in ("session-a", "session-a", "session-b"):
+            responses.append(
+                await client.post(
+                    "/v1/messages",
+                    headers={"x-session-id": session_id},
+                    json={"model": "claude-opus", "max_tokens": 10, "messages": []},
+                )
+            )
+
+    assert [response.status_code for response in responses] == [200, 200, 200]
+    assert [response.json()["usage"] for response in responses] == [
+        {"input_tokens": 4096, "output_tokens": 1},
+        {"input_tokens": 1024, "cache_read_input_tokens": 3072, "output_tokens": 1},
+        {"input_tokens": 4096, "output_tokens": 1},
+    ]
+
+    first_headers = captured[0]["headers"]
+    second_headers = captured[1]["headers"]
+    third_headers = captured[2]["headers"]
+    assert first_headers == second_headers
+    assert first_headers != third_headers
+    assert first_headers["session-id"] == "session-a"
+    assert third_headers["session-id"] == "session-b"
+    assert first_headers["x-codex-installation-id"] == third_headers["x-codex-installation-id"]
+    assert first_headers["thread-id"] != third_headers["thread-id"]
+    assert first_headers["x-codex-window-id"] != third_headers["x-codex-window-id"]
     await upstream_client.aclose()
 
 

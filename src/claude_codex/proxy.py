@@ -4,8 +4,10 @@ import argparse
 import asyncio
 import json
 import os
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -27,6 +29,29 @@ CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
 # Emit an SSE `ping` at least this often so a client never sees a silent stream
 # (e.g. during long model reasoning) and time the connection out.
 PING_INTERVAL_SECONDS = 15.0
+
+
+@dataclass(frozen=True, slots=True)
+class CodexRequestIdentity:
+    """Stable upstream identity for one Claude Code session.
+
+    The ChatGPT Codex backend uses all four IDs for request routing. In
+    particular, keeping them stable across turns lets it route repeated prompt
+    prefixes to the cache written by the first turn.
+    """
+
+    installation_id: str
+    session_id: str
+    thread_id: str
+    window_id: str
+
+    def client_metadata(self) -> dict[str, str]:
+        return {
+            "x-codex-installation-id": self.installation_id,
+            "session_id": self.session_id,
+            "thread_id": self.thread_id,
+            "x-codex-window-id": self.window_id,
+        }
 
 
 class BackendError(RuntimeError):
@@ -87,7 +112,7 @@ class CodexBackend:
         self.endpoint = endpoint
 
     async def events(
-        self, payload: dict[str, Any], session_id: str
+        self, payload: dict[str, Any], identity: CodexRequestIdentity
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         stale_access: str | None = None
         for attempt in range(2):
@@ -96,9 +121,16 @@ class CodexBackend:
                 "Authorization": f"Bearer {tokens.access}",
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
-                "originator": "claude-codex",
-                "User-Agent": "claude-codex/0.1.0",
-                "session-id": session_id,
+                # Match the first-party Codex client contract. The subscription
+                # endpoint uses this identity, not just prompt_cache_key, for
+                # stable cache routing between Claude Code turns.
+                "originator": "codex_cli_rs",
+                "User-Agent": "Codex/0.1.0",
+                "x-codex-installation-id": identity.installation_id,
+                "session-id": identity.session_id,
+                "thread-id": identity.thread_id,
+                "x-client-request-id": identity.thread_id,
+                "x-codex-window-id": identity.window_id,
             }
             if tokens.account_id:
                 headers["ChatGPT-Account-Id"] = tokens.account_id
@@ -129,6 +161,20 @@ def create_app(
         http,
         endpoint or os.environ.get("CLAUDE_CODEX_ENDPOINT", CODEX_ENDPOINT),
     )
+    installation_id = str(uuid.uuid4())
+    session_identities: dict[str, CodexRequestIdentity] = {}
+
+    def identity_for(session_id: str) -> CodexRequestIdentity:
+        identity = session_identities.get(session_id)
+        if identity is None:
+            identity = CodexRequestIdentity(
+                installation_id=installation_id,
+                session_id=session_id,
+                thread_id=str(uuid.uuid4()),
+                window_id=str(uuid.uuid4()),
+            )
+            session_identities[session_id] = identity
+        return identity
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -210,12 +256,14 @@ def create_app(
             or request.headers.get("session-id")
             or request.headers.get("anthropic-session-id", "claude-codex")
         )
+        identity = identity_for(session_id)
         upstream = to_responses_request(
             body,
             model=codex_model,
             reasoning_effort=reasoning,
-            prompt_cache_key=session_id,
+            prompt_cache_key=identity.session_id,
         )
+        upstream["client_metadata"] = identity.client_metadata()
 
         if body.get("stream", False):
             input_tokens = estimate_tokens(body)
@@ -233,7 +281,7 @@ def create_app(
 
                 async def pump() -> None:
                     try:
-                        async for event, data in backend.events(upstream, session_id):
+                        async for event, data in backend.events(upstream, identity):
                             await queue.put(("event", (event, data)))
                     except asyncio.CancelledError:
                         raise
@@ -279,7 +327,7 @@ def create_app(
             return StreamingResponse(stream(), media_type="text/event-stream")
 
         translator = AnthropicStream(requested_model)
-        async for event, data in backend.events(upstream, session_id):
+        async for event, data in backend.events(upstream, identity):
             translator.feed(event, data)
         translator.finish()
         return translator.response()

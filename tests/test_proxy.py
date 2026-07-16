@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from claude_codex.auth import Tokens
-from claude_codex.proxy import create_app
+from claude_codex.proxy import _remote_compact_enabled, create_app
 
 
 @pytest.fixture(autouse=True)
@@ -26,6 +26,13 @@ class FakeAuth:
 
     def load(self) -> Tokens:
         return Tokens("access", "refresh", int(time.time() * 1000) + 60_000, "acc-123", "test")
+
+
+def test_remote_compact_is_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("CLAUDE_CODEX_REMOTE_COMPACT", raising=False)
+    assert not _remote_compact_enabled()
+    monkeypatch.setenv("CLAUDE_CODEX_REMOTE_COMPACT", "true")
+    assert _remote_compact_enabled()
 
 
 async def test_proxy_streams_anthropic_events(monkeypatch) -> None:
@@ -263,6 +270,228 @@ async def test_proxy_reuses_complete_codex_cache_identity_for_claude_session() -
     await upstream_client.aclose()
 
 
+async def test_proxy_compacts_context_and_reuses_replacement_history(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "100")
+    monkeypatch.setenv("CLAUDE_CODEX_REMOTE_COMPACT", "1")
+    normal_inputs: list[list[dict[str, object]]] = []
+    compact_inputs: list[dict[str, object]] = []
+    normal_windows: list[str] = []
+    replacement_history = [
+        {"role": "system", "content": [{"type": "input_text", "text": "do not forward"}]},
+        {"role": "developer", "content": [{"type": "input_text", "text": "do not forward"}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "summary"}]},
+    ]
+    usable_replacement_history = [replacement_history[-1]]
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.path.endswith("/compact"):
+            compact_inputs.append(body)
+            return httpx.Response(200, json={"output": replacement_history})
+
+        input_items = body["input"]
+        normal_inputs.append(input_items)
+        normal_windows.append(request.headers["x-codex-window-id"])
+        input_tokens = 100 if len(normal_inputs) == 1 else 10
+        event = {
+            "type": "response.completed",
+            "response": {"usage": {"input_tokens": input_tokens, "output_tokens": 1}},
+        }
+        return httpx.Response(
+            200,
+            text=f"event: response.completed\ndata: {json.dumps(event)}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    app = create_app(auth=FakeAuth(), client=upstream_client, endpoint="https://codex.test/responses")
+    first_messages = [{"role": "user", "content": "first"}]
+    compacted_messages = [
+        *first_messages,
+        {"role": "assistant", "content": "answer one"},
+        {"role": "user", "content": "second"},
+    ]
+    after_compact_messages = [
+        *compacted_messages,
+        {"role": "assistant", "content": "answer two"},
+        {"role": "user", "content": "third"},
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+    ) as client:
+        for messages in (first_messages, compacted_messages, after_compact_messages):
+            response = await client.post(
+                "/v1/messages",
+                headers={"anthropic-session-id": "compact-session"},
+                json={"model": "claude-opus", "max_tokens": 10, "stream": True, "messages": messages},
+            )
+            assert response.status_code == 200
+
+    assert len(compact_inputs) == 1
+    assert compact_inputs[0]["input"] == [
+        {"role": "user", "content": [{"type": "input_text", "text": "first"}]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "answer one"}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "second"}]},
+    ]
+    assert compact_inputs[0]["model"] == "gpt-5.6-sol"
+    assert compact_inputs[0]["prompt_cache_key"] == "compact-session"
+    assert normal_inputs[2] == usable_replacement_history + [
+        {"role": "assistant", "content": [{"type": "output_text", "text": "answer two"}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "third"}]},
+    ]
+    assert normal_windows[0] != normal_windows[1]
+    assert normal_windows[1] == normal_windows[2]
+    log = capsys.readouterr().out
+    assert "codex_compact" in log
+    assert "result=started input_tokens=100 threshold=100" in log
+    assert "result=success implementation=remote" in log
+    assert "replacement_items=1" in log
+    await upstream_client.aclose()
+
+
+async def test_proxy_falls_back_to_local_compact_after_remote_disconnect(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "100")
+    monkeypatch.setenv("CLAUDE_CODEX_REMOTE_COMPACT", "1")
+    normal_inputs: list[list[dict[str, object]]] = []
+    remote_compact_calls = 0
+    local_compact_calls = 0
+    windows: list[str] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal remote_compact_calls, local_compact_calls
+        if request.url.path.endswith("/compact"):
+            remote_compact_calls += 1
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response")
+
+        body = json.loads(request.content)
+        input_items = body["input"]
+        last_content = input_items[-1].get("content") if input_items else []
+        if (
+            isinstance(last_content, list)
+            and last_content
+            and last_content[0].get("text", "").startswith("You are performing a context checkpoint")
+        ):
+            local_compact_calls += 1
+            events = [
+                {"type": "response.output_text.delta", "output_index": 0, "delta": "checkpoint"},
+                {"type": "response.completed", "response": {"usage": {"input_tokens": 100}}},
+            ]
+        else:
+            normal_inputs.append(input_items)
+            windows.append(request.headers["x-codex-window-id"])
+            input_tokens = 100 if len(normal_inputs) == 1 else 10
+            events = [
+                {
+                    "type": "response.completed",
+                    "response": {"usage": {"input_tokens": input_tokens, "output_tokens": 1}},
+                }
+            ]
+        content = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events)
+        return httpx.Response(200, text=content, headers={"content-type": "text/event-stream"})
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    app = create_app(auth=FakeAuth(), client=upstream_client, endpoint="https://codex.test/responses")
+    first_messages = [{"role": "user", "content": "first"}]
+    second_messages = [
+        *first_messages,
+        {"role": "assistant", "content": "answer one"},
+        {"role": "user", "content": "second"},
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+    ) as client:
+        for messages in (first_messages, second_messages):
+            response = await client.post(
+                "/v1/messages",
+                headers={"anthropic-session-id": "fallback-session"},
+                json={"model": "claude-opus", "max_tokens": 10, "stream": True, "messages": messages},
+            )
+            assert response.status_code == 200
+
+    assert remote_compact_calls == 1
+    assert local_compact_calls == 1
+    assert normal_inputs[1] == [
+        {"role": "user", "content": [{"type": "input_text", "text": "first"}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "second"}]},
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Context checkpoint summary:\ncheckpoint"}],
+        },
+    ]
+    assert windows[0] != windows[1]
+    log = capsys.readouterr().out
+    assert "result=remote_unavailable error=RemoteProtocolError" in log
+    assert "result=success implementation=local" in log
+    assert "replacement_items=3" in log
+    await upstream_client.aclose()
+
+
+async def test_proxy_isolates_compaction_branches_within_launcher_session(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "100")
+    monkeypatch.setenv("CLAUDE_CODEX_REMOTE_COMPACT", "1")
+    normal_inputs: list[list[dict[str, object]]] = []
+    normal_threads: list[str] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.path.endswith("/compact"):
+            text = json.dumps(body["input"])
+            summary = "summary-a" if "a2" in text else "summary-b"
+            return httpx.Response(
+                200,
+                json={"output": [{"role": "user", "content": [{"type": "input_text", "text": summary}]}]},
+            )
+
+        input_items = body["input"]
+        normal_inputs.append(input_items)
+        normal_threads.append(request.headers["thread-id"])
+        initial_user_text = (
+            input_items[0]["content"][0].get("text")
+            if len(input_items) == 1 and input_items and isinstance(input_items[0].get("content"), list)
+            else None
+        )
+        input_tokens = 100 if initial_user_text in {"a", "b"} else 10
+        event = {
+            "type": "response.completed",
+            "response": {"usage": {"input_tokens": input_tokens, "output_tokens": 1}},
+        }
+        return httpx.Response(
+            200,
+            text=f"event: response.completed\ndata: {json.dumps(event)}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    app = create_app(auth=FakeAuth(), client=upstream_client, endpoint="https://codex.test/responses")
+    branch_a1 = [{"role": "user", "content": "a"}]
+    branch_a2 = [*branch_a1, {"role": "assistant", "content": "answer-a1"}, {"role": "user", "content": "a2"}]
+    branch_a3 = [*branch_a2, {"role": "assistant", "content": "answer-a2"}, {"role": "user", "content": "a3"}]
+    branch_b1 = [{"role": "user", "content": "b"}]
+    branch_b2 = [*branch_b1, {"role": "assistant", "content": "answer-b1"}, {"role": "user", "content": "b2"}]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+    ) as client:
+        for messages in (branch_a1, branch_a2, branch_b1, branch_b2, branch_a3):
+            response = await client.post(
+                "/v1/messages",
+                headers={"x-session-id": "shared-launcher-session"},
+                json={"model": "claude-opus", "max_tokens": 10, "stream": True, "messages": messages},
+            )
+            assert response.status_code == 200
+
+    assert normal_inputs[1] == [{"role": "user", "content": [{"type": "input_text", "text": "summary-a"}]}]
+    assert normal_inputs[3] == [{"role": "user", "content": [{"type": "input_text", "text": "summary-b"}]}]
+    assert normal_inputs[4] == [
+        {"role": "user", "content": [{"type": "input_text", "text": "summary-a"}]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "answer-a2"}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "a3"}]},
+    ]
+    assert normal_threads[1] == normal_threads[4]
+    assert normal_threads[1] != normal_threads[3]
+    assert "result=discarded reason=history_changed" not in capsys.readouterr().out
+    await upstream_client.aclose()
+
+
 async def test_nonstream_surfaces_cached_input_usage(capsys, isolated_installation_id: Path) -> None:
     async def upstream(_: httpx.Request) -> httpx.Response:
         events = [
@@ -373,6 +602,39 @@ async def test_streaming_backend_error_is_sse_error() -> None:
     await upstream_client.aclose()
 
 
+async def test_retries_transport_disconnect_before_first_sse_event() -> None:
+    calls = 0
+
+    async def upstream(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.RemoteProtocolError("disconnected")
+        event = {
+            "type": "response.completed",
+            "response": {"usage": {"input_tokens": 3, "output_tokens": 1}},
+        }
+        return httpx.Response(
+            200,
+            text=f"event: response.completed\\ndata: {json.dumps(event)}\\n\\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    app = create_app(auth=FakeAuth(), client=upstream_client, endpoint="https://codex.test/responses")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+    ) as client:
+        response = await client.post(
+            "/v1/messages",
+            json={"model": "claude-opus", "max_tokens": 10, "messages": []},
+        )
+
+    assert response.status_code == 200
+    assert calls == 2
+    await upstream_client.aclose()
+
+
 async def test_streaming_backend_429_is_rate_limit_error() -> None:
     async def upstream(_: httpx.Request) -> httpx.Response:
         return httpx.Response(429, text='{"error":{"message":"usage limit"}}')
@@ -410,6 +672,30 @@ async def test_nonstream_backend_429_maps_status_and_retry_after() -> None:
     assert response.status_code == 429
     assert response.json()["error"]["type"] == "rate_limit_error"
     assert response.headers["retry-after"] == "42"
+    await upstream_client.aclose()
+
+
+async def test_nonstream_transport_error_is_an_anthropic_error() -> None:
+    calls = 0
+
+    async def upstream(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.RemoteProtocolError("Server disconnected without sending a response")
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    app = create_app(auth=FakeAuth(), client=upstream_client, endpoint="https://codex.test/responses")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy.test"
+    ) as client:
+        response = await client.post(
+            "/v1/messages",
+            json={"model": "claude-opus", "max_tokens": 10, "messages": []},
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "api_error"
+    assert calls == 2
     await upstream_client.aclose()
 
 

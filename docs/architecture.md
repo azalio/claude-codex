@@ -143,7 +143,8 @@ OpenCode and Codex credential files are read-only inputs. Refreshed credentials 
   UUID stored at `~/.config/claude-codex/installation_id`; it is distinct from Codex CLI's own ID.
 - **Backend configurability:** `CLAUDE_CODEX_MODEL`, `CLAUDE_CODEX_REASONING`,
   `CLAUDE_CODEX_ENDPOINT`, `CLAUDE_CODEX_PORT`, `CLAUDE_CODEX_AUTH_FILE`,
-  `CLAUDE_CODEX_LOG_MAX_BYTES`, `CLAUDE_CODEX_COMPACT_AT`, and `CLAUDE_CODEX_BIN_DIR` control
+  `CLAUDE_CODEX_LOG_MAX_BYTES`, `CLAUDE_CODEX_COMPACT_AT`, `CLAUDE_CODEX_REMOTE_COMPACT`, and
+  `CLAUDE_CODEX_BIN_DIR` control
   runtime or install behavior.
 
 ## Deployment/Operations

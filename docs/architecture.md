@@ -94,8 +94,10 @@ flags, and an `X-Session-Id` custom header before invoking `claude`.
 1. The launcher polls `/health` for readiness and then executes `claude` with Anthropic environment
    variables pointing to the local proxy.
 1. Claude Code sends Anthropic Messages requests to `/v1/messages`.
-1. The proxy loads or refreshes ChatGPT OAuth credentials, translates the request into a Codex
-   Responses request, and streams upstream events from the configured Codex endpoint.
+1. The proxy loads or refreshes ChatGPT OAuth credentials, derives a stable upstream identity from
+   Claude Code's native `anthropic-session-id` header first, then `session-id`, then the launcher
+   `x-session-id`, translates the request into a Codex Responses request, and streams upstream
+   events from the configured Codex endpoint.
 1. `AnthropicStream` translates text and function-call deltas back into Anthropic SSE events.
 1. When Claude Code exits, the launcher terminates the proxy process group and closes the proxy log.
 
@@ -130,13 +132,19 @@ OpenCode and Codex credential files are read-only inputs. Refreshed credentials 
   `content_block_*`, `message_delta`, and `message_stop` events.
 - **Credential locality:** external credential sources are read, while refresh writes are isolated to
   the private `claude-codex` cache.
-- **Session isolation:** each launcher run creates a UUID session header and owns its local proxy
-  process lifecycle.
+- **Session isolation:** each launcher run creates a UUID launcher session header and owns its local
+  proxy lifecycle, while upstream Codex identity is keyed by `(session_source, session_id)`. Native
+  Claude Code session headers take precedence over the launcher fallback so Codex prompt-cache,
+  session, thread, and window identifiers stay stable across requests from the same Claude session.
+- **Cache-routing telemetry:** proxy request logs include the selected client id, session source,
+  and session id so cache-key routing changes can be diagnosed without persisting upstream
+  Responses payloads.
 - **Installation identity:** the upstream `x-codex-installation-id` is a persistent, proxy-owned
   UUID stored at `~/.config/claude-codex/installation_id`; it is distinct from Codex CLI's own ID.
 - **Backend configurability:** `CLAUDE_CODEX_MODEL`, `CLAUDE_CODEX_REASONING`,
   `CLAUDE_CODEX_ENDPOINT`, `CLAUDE_CODEX_PORT`, `CLAUDE_CODEX_AUTH_FILE`,
-  `CLAUDE_CODEX_LOG_MAX_BYTES`, and `CLAUDE_CODEX_BIN_DIR` control runtime or install behavior.
+  `CLAUDE_CODEX_LOG_MAX_BYTES`, `CLAUDE_CODEX_COMPACT_AT`, and `CLAUDE_CODEX_BIN_DIR` control
+  runtime or install behavior.
 
 ## Deployment/Operations
 
@@ -172,7 +180,11 @@ No ADR files are present in the repository. Architectural decisions are currentl
 
 ## Freshness
 
-Last refreshed: 2026-07-15.
+Last refreshed: 2026-07-16.
+
+Refresh reason: Native Claude Code session identity is now preferred over the launcher fallback for
+upstream Codex cache/session routing, and proxy logs expose the selected session source for
+diagnostics.
 
 Evidence used for this refresh:
 

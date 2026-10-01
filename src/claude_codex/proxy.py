@@ -6,7 +6,6 @@ import copy
 import fcntl
 import json
 import os
-import ssl
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -20,6 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .auth import AuthError, AuthManager, AuthProvider
+from .tls import upstream_ssl_context
 from .translate import (
     AnthropicStream,
     encode_sse,
@@ -415,7 +415,7 @@ def create_app(
 ) -> FastAPI:
     owns_client = client is None
     http = client or httpx.AsyncClient(
-        verify=ssl.create_default_context(), timeout=httpx.Timeout(300, connect=30)
+        verify=upstream_ssl_context(), timeout=httpx.Timeout(300, connect=30)
     )
     manager = auth or AuthManager(client=http)
     backend = CodexBackend(

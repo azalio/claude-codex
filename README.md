@@ -30,9 +30,11 @@ credential files are never modified.
 
 ## TLS certificates
 
-Upstream HTTPS requests and OAuth token refreshes use the system CA trust store, including
-locally installed organization certificates. Certificate and hostname verification remain enabled.
-To supply a custom CA bundle or OpenSSL certificate directory, set `SSL_CERT_FILE` or `SSL_CERT_DIR`:
+Upstream HTTPS requests and OAuth token refreshes trust certifi's public CA bundle plus the
+Python/OpenSSL default CA store, including organization certificates installed there. The public
+bundle remains available when Python has no default CA paths. Certificate and hostname
+verification remain enabled. To replace the default trust with a custom CA bundle or OpenSSL
+certificate directory, set `SSL_CERT_FILE` or `SSL_CERT_DIR` (`SSL_CERT_FILE` takes precedence):
 
 ```bash
 SSL_CERT_FILE=/path/to/ca-bundle.pem claude-codex

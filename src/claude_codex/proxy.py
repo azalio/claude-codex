@@ -4,19 +4,24 @@ import argparse
 import asyncio
 import copy
 import fcntl
+import hashlib
 import json
+import math
 import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from .auth import AuthError, AuthManager, AuthProvider
 from .tls import upstream_ssl_context
@@ -42,6 +47,7 @@ LOCAL_SUMMARY_PREFIX = "Context checkpoint summary:"
 # Emit an SSE `ping` at least this often so a client never sees a silent stream
 # (e.g. during long model reasoning) and time the connection out.
 PING_INTERVAL_SECONDS = 15.0
+UPSTREAM_HEADERS_EVENT = "_proxy.response_headers"
 
 
 def _resolve_installation_id(path: Path) -> str:
@@ -76,6 +82,20 @@ class CodexRequestIdentity:
     session_source: str
     thread_id: str
     window_id: str
+    agent_id: str = ""
+    request_class: str = "main"
+
+    @property
+    def scope_key(self) -> tuple[str, str, str, str]:
+        return self.session_source, self.session_id, self.agent_id, self.request_class
+
+    @property
+    def cache_key(self) -> str:
+        if not self.agent_id and self.request_class == "main":
+            return self.session_id
+        return hashlib.sha256(
+            json.dumps([self.session_id, self.agent_id, self.request_class]).encode()
+        ).hexdigest()
 
     def client_metadata(self) -> dict[str, str]:
         return {
@@ -102,13 +122,60 @@ class CompactionState:
 class BackendError(RuntimeError):
     """A non-success HTTP response from the Codex backend."""
 
-    def __init__(self, status_code: int, body: str, retry_after: str | None = None) -> None:
+    def __init__(self, status_code: int, body: str, headers: httpx.Headers) -> None:
         super().__init__(f"Codex backend HTTP {status_code}: {body}")
         self.status_code = status_code
-        self.retry_after = retry_after
+        self.body = body
+        self.headers = _response_headers(headers)
+
+    def error_body(self) -> dict[str, Any]:
+        try:
+            body = json.loads(self.body)
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and isinstance(body.get("error"), dict):
+            error = body["error"].copy()
+            error.setdefault("type", _error_type(self.status_code))
+            error.setdefault("message", self.body)
+            return {**body, "type": "error", "error": error}
+        return {"type": "error", "error": {"type": _error_type(self.status_code), "message": self.body}}
+
+
+def _response_headers(headers: httpx.Headers) -> dict[str, str]:
+    """Передаёт control headers открытым семейством, без cookies и hop-by-hop."""
+    result = {
+        name: value
+        for name, value in headers.items()
+        if name in {"retry-after", "x-should-retry", "request-id"}
+        or name.startswith("anthropic-ratelimit-unified-")
+    }
+    if retry_after := result.get("retry-after"):
+        try:
+            seconds = int(retry_after)
+        except ValueError:
+            try:
+                deadline = parsedate_to_datetime(retry_after)
+                if deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=UTC)
+                seconds = math.ceil((deadline - datetime.now(UTC)).total_seconds())
+            except (ValueError, TypeError, OverflowError):
+                result.pop("retry-after")
+                return result
+        result["retry-after"] = str(max(0, seconds))
+    return result
 
 
 def _error_type(status_code: int) -> str:
+    if status_code in {400, 422}:
+        return "invalid_request_error"
+    if status_code == 401:
+        return "authentication_error"
+    if status_code == 403:
+        return "permission_error"
+    if status_code == 404:
+        return "not_found_error"
+    if status_code == 413:
+        return "request_too_large"
     # Preserve the upstream rate-limit / overload semantics so the client backs
     # off instead of treating a 429 as a generic bad-gateway and retry-storming.
     if status_code == 429:
@@ -119,12 +186,9 @@ def _error_type(status_code: int) -> str:
 
 
 def _stream_error(exc: Exception) -> dict[str, Any]:
-    if isinstance(exc, AuthError):
-        kind = "authentication_error"
-    elif isinstance(exc, BackendError):
-        kind = _error_type(exc.status_code)
-    else:
-        kind = "api_error"
+    if isinstance(exc, BackendError):
+        return exc.error_body()
+    kind = "authentication_error" if isinstance(exc, AuthError) else "api_error"
     return {"type": "error", "error": {"type": kind, "message": str(exc)}}
 
 
@@ -235,6 +299,8 @@ def _sanitize_remote_replacement_history(
 def _local_compact_payload(upstream: dict[str, Any]) -> dict[str, Any]:
     """Формирует fallback-компакт обычным, уже поддерживаемым `/responses`."""
     payload = copy.deepcopy(upstream)
+    # Внутренний handoff — текстовый summary, а не JSON ответ на основной запрос.
+    payload.pop("text", None)
     payload["input"].append(
         {
             "role": "user",
@@ -270,6 +336,16 @@ def _local_replacement_history(input_items: list[dict[str, Any]], summary: str) 
     return selected
 
 
+def _sse_payload(raw: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        raise RuntimeError("Codex stream contains an invalid JSON event") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Codex stream event must be a JSON object")
+    return payload
+
+
 async def _sse(response: httpx.Response) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     event = "message"
     data: list[str] = []
@@ -278,8 +354,8 @@ async def _sse(response: httpx.Response) -> AsyncIterator[tuple[str, dict[str, A
             if data:
                 raw = "\n".join(data)
                 if raw != "[DONE]":
-                    payload = json.loads(raw)
-                    yield event, payload
+                    payload = _sse_payload(raw)
+                    yield str(payload.get("type") or event), payload
                 event, data = "message", []
             continue
         if line.startswith("event:"):
@@ -289,7 +365,8 @@ async def _sse(response: httpx.Response) -> AsyncIterator[tuple[str, dict[str, A
     if data:
         raw = "\n".join(data)
         if raw != "[DONE]":
-            yield event, json.loads(raw)
+            payload = _sse_payload(raw)
+            yield str(payload.get("type") or event), payload
 
 
 class CodexBackend:
@@ -318,7 +395,11 @@ class CodexBackend:
         return headers
 
     async def events(
-        self, payload: dict[str, Any], identity: CodexRequestIdentity
+        self,
+        payload: dict[str, Any],
+        identity: CodexRequestIdentity,
+        *,
+        request_headers: dict[str, str] | None = None,
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         stale_access: str | None = None
         auth_retried = False
@@ -326,6 +407,7 @@ class CodexBackend:
         while True:
             tokens = await self.auth.get(force_refresh=auth_retried, stale_access=stale_access)
             headers = self._headers(tokens, identity, accept="text/event-stream")
+            headers.update(request_headers or {})
             emitted_event = False
             try:
                 async with self.client.stream(
@@ -337,14 +419,17 @@ class CodexBackend:
                         continue
                     if response.is_error:
                         body = (await response.aread()).decode(errors="replace")
-                        raise BackendError(
-                            response.status_code, body[:500], response.headers.get("retry-after")
-                        )
+                        raise BackendError(response.status_code, body, response.headers)
+                    # Получаем HTTP headers до начала клиентского SSE. Это позволяет
+                    # вернуть настоящий 4xx/5xx и retry controls вместо HTTP 200.
+                    yield UPSTREAM_HEADERS_EVENT, _response_headers(response.headers)
                     async for event, data in _sse(response):
                         emitted_event = True
                         _log_upstream_cache_usage(event, data, identity)
                         yield event, data
-                    return
+                        if event in {"response.completed", "response.incomplete", "response.failed", "error"}:
+                            return
+                    raise RuntimeError("Codex stream ended without a terminal response event")
             except httpx.TransportError as exc:
                 # Повторять можно только запрос, с которого ещё не поступил ни один
                 # SSE event: иначе клиент получит дублированные tool/text deltas.
@@ -375,8 +460,8 @@ class CodexBackend:
             if response.is_error:
                 raise BackendError(
                     response.status_code,
-                    response.text[:500],
-                    response.headers.get("retry-after"),
+                    response.text,
+                    response.headers,
                 )
             try:
                 result = response.json()
@@ -414,9 +499,7 @@ def create_app(
     installation_id_path: Path | None = None,
 ) -> FastAPI:
     owns_client = client is None
-    http = client or httpx.AsyncClient(
-        verify=upstream_ssl_context(), timeout=httpx.Timeout(300, connect=30)
-    )
+    http = client or httpx.AsyncClient(verify=upstream_ssl_context(), timeout=httpx.Timeout(300, connect=30))
     manager = auth or AuthManager(client=http)
     backend = CodexBackend(
         manager,
@@ -424,15 +507,17 @@ def create_app(
         endpoint or os.environ.get("CLAUDE_CODEX_ENDPOINT", CODEX_ENDPOINT),
     )
     installation_id = _resolve_installation_id(installation_id_path or INSTALLATION_ID_PATH)
-    session_identities: dict[tuple[str, str], CodexRequestIdentity] = {}
-    compaction_states: dict[tuple[str, str], list[CompactionState]] = {}
-    remote_compact_available: dict[tuple[str, str], bool] = {}
+    session_identities: dict[tuple[str, str, str, str], CodexRequestIdentity] = {}
+    compaction_states: dict[tuple[str, str, str, str], list[CompactionState]] = {}
+    remote_compact_available: dict[tuple[str, str, str, str], bool] = {}
     branch_counter = 0
     compact_at_tokens = _compact_at_tokens()
     remote_compact_enabled = _remote_compact_enabled()
 
-    def identity_for(session_source: str, session_id: str) -> CodexRequestIdentity:
-        key = (session_source, session_id)
+    def identity_for(
+        session_source: str, session_id: str, agent_id: str, request_class: str
+    ) -> CodexRequestIdentity:
+        key = (session_source, session_id, agent_id, request_class)
         identity = session_identities.get(key)
         if identity is None:
             identity = CodexRequestIdentity(
@@ -441,6 +526,8 @@ def create_app(
                 session_source=session_source,
                 thread_id=str(uuid.uuid4()),
                 window_id=str(uuid.uuid4()),
+                agent_id=agent_id,
+                request_class=request_class,
             )
             session_identities[key] = identity
         return identity
@@ -453,7 +540,7 @@ def create_app(
     ) -> CompactionState:
         """Выбирает ветку по самому длинному ранее отправленному префиксу."""
         nonlocal branch_counter
-        key = (session_source, session_id)
+        key = identity.scope_key
         states = compaction_states.setdefault(key, [])
         candidates = [
             state for state in states if _suffix_after_prefix(raw_input, state.last_raw_input) is not None
@@ -476,6 +563,8 @@ def create_app(
                 session_source=identity.session_source,
                 thread_id=str(uuid.uuid4()),
                 window_id=str(uuid.uuid4()),
+                agent_id=identity.agent_id,
+                request_class=identity.request_class,
             )
         )
         state = CompactionState(
@@ -495,10 +584,12 @@ def create_app(
             session_source=identity.session_source,
             thread_id=identity.thread_id,
             window_id=str(uuid.uuid4()),
+            agent_id=identity.agent_id,
+            request_class=identity.request_class,
         )
 
     def request_session_identity(request: Request) -> tuple[str, str]:
-        for header in ("anthropic-session-id", "session-id", "x-session-id"):
+        for header in ("x-claude-code-session-id", "anthropic-session-id", "session-id", "x-session-id"):
             if value := request.headers.get(header):
                 return header, value
         return "default", "claude-codex"
@@ -520,12 +611,10 @@ def create_app(
 
     @app.exception_handler(BackendError)
     async def backend_http_error(_: Request, exc: BackendError) -> JSONResponse:
-        status = exc.status_code if exc.status_code in {429, 529} else 502
-        headers = {"Retry-After": exc.retry_after} if exc.retry_after else None
         return JSONResponse(
-            status_code=status,
-            headers=headers,
-            content={"type": "error", "error": {"type": _error_type(exc.status_code), "message": str(exc)}},
+            status_code=exc.status_code,
+            headers=exc.headers,
+            content=exc.error_body(),
         )
 
     @app.exception_handler(RuntimeError)
@@ -568,6 +657,34 @@ def create_app(
             "startup_id": startup_id,
         }
 
+    @app.head("/api/hello")
+    async def hello() -> Response:
+        return Response(status_code=204)
+
+    @app.get("/v1/models")
+    async def models() -> dict[str, Any]:
+        # Показываем один реально настроенный backend, а не список Claude-моделей.
+        model = os.environ.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
+        alias = os.environ.get("ANTHROPIC_MODEL") or "claude-codex"
+        if not any(name in alias.lower() for name in ("claude", "anthropic")):
+            alias = "claude-codex"
+        return {
+            "data": [
+                {
+                    "type": "model",
+                    "id": alias,
+                    "display_name": f"Codex: {model}",
+                    "description": (
+                        f"Routes to {model} via the Codex subscription; "
+                        "Anthropic server safeguards are unavailable."
+                    ),
+                }
+            ],
+            "has_more": False,
+            "first_id": alias,
+            "last_id": alias,
+        }
+
     @app.post("/v1/messages/count_tokens", response_model=None)
     async def count_tokens(request: Request) -> dict[str, int] | JSONResponse:
         body = await request_body(request)
@@ -584,7 +701,10 @@ def create_app(
         upstream: dict[str, Any],
     ) -> CodexRequestIdentity:
         """Подменяет полный Claude-префикс результатом `/responses/compact`."""
-        session_key = (session_source, session_id)
+        # Classifier и штатный Claude compact должны видеть исходную историю.
+        if identity.request_class in {"auxiliary", "compaction"}:
+            return identity
+        session_key = identity.scope_key
         raw_input = copy.deepcopy(upstream["input"])
         if state.original_prefix is not None and state.replacement_history is not None:
             suffix = _suffix_after_prefix(raw_input, state.original_prefix)
@@ -687,14 +807,25 @@ def create_app(
             return body
         requested_model = str(body.get("model") or "claude-codex")
         codex_model = os.environ.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
-        reasoning = os.environ.get("CLAUDE_CODEX_REASONING", "xhigh")
+        requested_effort = (body.get("output_config") or {}).get("effort", "xhigh")
+        reasoning = os.environ.get("CLAUDE_CODEX_REASONING") or (
+            "xhigh" if requested_effort == "max" else requested_effort
+        )
         session_source, session_id = request_session_identity(request)
-        session_identity = identity_for(session_source, session_id)
+        session_identity = identity_for(
+            session_source,
+            session_id,
+            request.headers.get("x-claude-code-agent-id", ""),
+            request.headers.get("x-claude-code-request-class") or "main",
+        )
+        # Hints имеют открытый набор имён. Credentials и произвольные custom
+        # headers клиента не должны попадать в другой backend.
+        hints = {name: value for name, value in request.headers.items() if name.startswith("x-claude-code-")}
         upstream = to_responses_request(
             body,
             model=codex_model,
             reasoning_effort=reasoning,
-            prompt_cache_key=session_identity.session_id,
+            prompt_cache_key=session_identity.cache_key,
         )
         compaction_state = compaction_state_for(
             session_source,
@@ -714,6 +845,14 @@ def create_app(
 
         if body.get("stream", False):
             input_tokens = estimate_tokens(body)
+            events = backend.events(upstream, identity, request_headers=hints)
+            # Первый служебный event подтверждает успешный HTTP ответ upstream.
+            # Тело остаётся потоковым и не буферизуется до завершения inference.
+            try:
+                _, response_headers = await anext(events)
+            except BaseException:
+                await events.aclose()
+                raise
 
             async def stream() -> AsyncIterator[str]:
                 translator = AnthropicStream(
@@ -728,7 +867,9 @@ def create_app(
 
                 async def pump() -> None:
                     try:
-                        async for event, data in backend.events(upstream, identity):
+                        async for event, data in events:
+                            if event == UPSTREAM_HEADERS_EVENT:
+                                continue
                             input_tokens = _reported_input_tokens(event, data)
                             if input_tokens is not None:
                                 compaction_state.last_input_tokens = input_tokens
@@ -774,6 +915,7 @@ def create_app(
                     task.cancel()
                     with suppress(BaseException):
                         await task
+                    await events.aclose()
                 if cancelled:
                     return
                 if error is not None:
@@ -782,16 +924,25 @@ def create_app(
                     for name, chunk in translator.finish():
                         yield encode_sse(name, chunk)
 
-            return StreamingResponse(stream(), media_type="text/event-stream")
+            return StreamingResponse(
+                stream(),
+                media_type="text/event-stream",
+                headers=response_headers,
+                background=BackgroundTask(events.aclose),
+            )
 
         translator = AnthropicStream(requested_model)
-        async for event, data in backend.events(upstream, identity):
+        response_headers = {}
+        async for event, data in backend.events(upstream, identity, request_headers=hints):
+            if event == UPSTREAM_HEADERS_EVENT:
+                response_headers = data
+                continue
             input_tokens = _reported_input_tokens(event, data)
             if input_tokens is not None:
                 compaction_state.last_input_tokens = input_tokens
             translator.feed(event, data)
         translator.finish()
-        return translator.response()
+        return JSONResponse(translator.response(), headers=response_headers)
 
     return app
 

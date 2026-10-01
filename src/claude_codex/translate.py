@@ -120,6 +120,16 @@ def _tool_choice(value: Any) -> Any:
 def validate_messages_request(payload: Any, *, require_messages: bool = True) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Request body must be a JSON object")
+    if "safeguards" in payload:
+        raise ValueError(
+            "Codex does not implement Anthropic safeguards or safeguard_results; "
+            "start Claude Code with CLAUDE_CODE_AUTO_MODE_SERVER=0 to use client-side checks"
+        )
+    if "context_management" in payload:
+        raise ValueError(
+            "Codex does not implement Anthropic context_management; "
+            "set CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 (proxy compaction remains available)"
+        )
     system = payload.get("system")
     if system is not None:
         if not isinstance(system, (str, list)):
@@ -147,6 +157,10 @@ def validate_messages_request(payload: Any, *, require_messages: bool = True) ->
                 for block in content:
                     if not isinstance(block, dict):
                         raise ValueError("each content block must be an object")
+                    if block.get("type") == "tool_reference":
+                        raise ValueError(
+                            "Codex does not implement tool_reference; set ENABLE_TOOL_SEARCH=false"
+                        )
                     if block.get("type") == "image" and not isinstance(block.get("source"), dict):
                         raise ValueError("image source must be an object")
                     if block.get("type") == "tool_result":
@@ -157,11 +171,45 @@ def validate_messages_request(payload: Any, *, require_messages: bool = True) ->
                             isinstance(item, dict) for item in result_content
                         ):
                             raise ValueError("each tool result content block must be an object")
+                        if isinstance(result_content, list) and any(
+                            item.get("type") == "tool_reference" for item in result_content
+                        ):
+                            raise ValueError(
+                                "Codex does not implement tool_reference; set ENABLE_TOOL_SEARCH=false"
+                            )
     tools = payload.get("tools")
     if tools is not None and (
         not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools)
     ):
         raise ValueError("tools must be an array of objects")
+    for tool in tools or []:
+        kind = tool.get("type")
+        if kind not in {None, "custom"}:
+            raise ValueError(f"Input tag '{kind}' in tools is not supported by the Codex bridge")
+        if tool.get("defer_loading"):
+            raise ValueError("Codex does not implement defer_loading; set ENABLE_TOOL_SEARCH=false")
+        if "strict" in tool and not isinstance(tool["strict"], bool):
+            raise ValueError("tool strict must be a boolean")
+    output_config = payload.get("output_config")
+    if output_config is not None:
+        if not isinstance(output_config, dict):
+            raise ValueError("output_config must be an object")
+        if "effort" in output_config and output_config["effort"] not in {
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        }:
+            raise ValueError("output_config.effort must be low, medium, high, xhigh, or max")
+        if "format" in output_config:
+            output_format = output_config["format"]
+            if not isinstance(output_format, dict) or output_format.get("type") != "json_schema":
+                raise ValueError("output_config.format must use json_schema")
+            if not isinstance(output_format.get("schema"), dict):
+                raise ValueError("output_config.format.schema must be an object")
+        if "task_budget" in output_config:
+            raise ValueError("Codex does not implement output_config.task_budget")
     max_tokens = payload.get("max_tokens")
     if max_tokens is not None and (
         isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0
@@ -192,7 +240,7 @@ def to_responses_request(
             "name": tool["name"],
             "description": tool.get("description") or "",
             "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
-            "strict": False,
+            "strict": tool.get("strict", False),
         }
         for tool in payload.get("tools") or []
         if tool.get("name")
@@ -208,6 +256,16 @@ def to_responses_request(
     }
     if prompt_cache_key:
         request["prompt_cache_key"] = _bounded_cache_key(prompt_cache_key)
+    output_format = (payload.get("output_config") or {}).get("format")
+    if output_format:
+        request["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": "response",
+                "schema": output_format["schema"],
+                "strict": True,
+            }
+        }
     # NB: the Codex `/responses` backend rejects `max_output_tokens`
     # ("Unsupported parameter") and manages output length itself, so the
     # Anthropic `max_tokens` is validated on the way in but not forwarded.
@@ -297,6 +355,8 @@ class AnthropicStream:
     ) -> tuple[Block, list[tuple[str, dict[str, Any]]]]:
         existing = self.by_output.get(output_index)
         if existing:
+            if not existing.open or existing.kind != kind:
+                raise RuntimeError("Codex stream references a closed or incompatible content block")
             return existing, []
         item = item or {}
         block = Block(

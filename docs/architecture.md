@@ -63,8 +63,8 @@ flags, and an `X-Session-Id` custom header before invoking `claude`.
 - `src/claude_codex/launcher.py`: finds `claude`, chooses or reads a local port, starts the proxy,
   waits for `/health`, injects Anthropic environment variables, runs Claude Code, and terminates the
   proxy process group on exit.
-- `src/claude_codex/proxy.py`: defines the FastAPI app, `/health`, `/v1/messages/count_tokens`, and
-  `/v1/messages`; forwards translated requests to the Codex backend through `httpx`.
+- `src/claude_codex/proxy.py`: defines the FastAPI app, `/health`, `/api/hello`, `/v1/models`,
+  `/v1/messages/count_tokens`, and `/v1/messages`; forwards translated requests through `httpx`.
 - `src/claude_codex/translate.py`: lowers Anthropic message payloads into Responses input items,
   converts tool definitions/tool choice, estimates token counts, encodes SSE, and translates
   Responses streaming events back into Anthropic message events.
@@ -95,8 +95,10 @@ flags, and an `X-Session-Id` custom header before invoking `claude`.
    variables pointing to the local proxy.
 1. Claude Code sends Anthropic Messages requests to `/v1/messages`.
 1. The proxy loads or refreshes ChatGPT OAuth credentials, derives a stable upstream identity from
-   Claude Code's native `anthropic-session-id` header first, then `session-id`, then the launcher
-   `x-session-id`, translates the request into a Codex Responses request, and streams upstream
+   Claude Code's native `x-claude-code-session-id` header first, then `anthropic-session-id`,
+   `session-id`, and the launcher `x-session-id`. Agent IDs and request classes isolate
+   thread/cache/compaction state; classifier and native compaction requests retain their original input.
+   It translates the request into a Codex Responses request and streams upstream
    events from the configured Codex endpoint.
 1. `AnthropicStream` translates text and function-call deltas back into Anthropic SSE events.
 1. When Claude Code exits, the launcher terminates the proxy process group and closes the proxy log.
@@ -133,7 +135,8 @@ OpenCode and Codex credential files are read-only inputs. Refreshed credentials 
 - **Credential locality:** external credential sources are read, while refresh writes are isolated to
   the private `claude-codex` cache.
 - **Session isolation:** each launcher run creates a UUID launcher session header and owns its local
-  proxy lifecycle, while upstream Codex identity is keyed by `(session_source, session_id)`. Native
+  proxy lifecycle, while upstream Codex identity is keyed by
+  `(session_source, session_id, agent_id, request_class)`. Native
   Claude Code session headers take precedence over the launcher fallback so Codex prompt-cache,
   session, thread, and window identifiers stay stable across requests from the same Claude session.
 - **Cache-routing telemetry:** proxy request logs include the selected client id, session source,
@@ -170,7 +173,12 @@ with `pytest`; lint rules are configured through Ruff in `pyproject.toml`.
 - Token counting is approximate and based on serialized payload length rather than the upstream model
   tokenizer.
 - The launcher requires a working local `claude` executable; there is no fallback CLI.
-- The proxy currently retries once on upstream `401`, then surfaces backend failures as HTTP `502`.
+- The proxy retries once on upstream `401` and once on transport failure before any SSE event.
+  HTTP backend errors retain their status and retry headers; transport/protocol faults return `502`
+  before streaming starts or an SSE error after headers have been sent.
+- Anthropic server-side safeguards, beta context management, and provider tools are unavailable.
+  The launcher configures client-side classifier checks and ordinary function tools; see the
+  [gateway compatibility matrix](gateway-compatibility.md).
 - The project has no dedicated integration test that launches the real `claude` binary against a
   live Codex backend.
 
@@ -181,11 +189,10 @@ No ADR files are present in the repository. Architectural decisions are currentl
 
 ## Freshness
 
-Last refreshed: 2026-07-16.
+Last refreshed: 2026-10-01.
 
-Refresh reason: Native Claude Code session identity is now preferred over the launcher fallback for
-upstream Codex cache/session routing, and proxy logs expose the selected session source for
-diagnostics.
+Refresh reason: Gateway compatibility, classifier fallback, native session/agent routing,
+response controls, terminal SSE validation, structured outputs, effort, and model discovery.
 
 Evidence used for this refresh:
 

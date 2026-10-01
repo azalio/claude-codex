@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from pathlib import Path
 from typing import Any
 
@@ -188,7 +190,14 @@ async def test_proxy_prefers_native_session_over_launcher_session() -> None:
         for native_session in ("native-a", "native-b"):
             response = await client.post(
                 "/v1/messages",
-                headers={"x-session-id": "launcher-session", "anthropic-session-id": native_session},
+                headers={
+                    "x-session-id": "launcher-session",
+                    "anthropic-session-id": "legacy-session",
+                    "X-Claude-Code-Session-Id": native_session,
+                    "x-claude-code-request-class": "main",
+                    "x-claude-code-future-hint": "opaque-value",
+                    "anthropic-beta": "unknown-future-beta",
+                },
                 json={"model": "claude-opus", "max_tokens": 10, "messages": []},
             )
             assert response.status_code == 200
@@ -392,11 +401,13 @@ async def test_proxy_falls_back_to_local_compact_after_remote_disconnect(monkeyp
             and last_content[0].get("text", "").startswith("You are performing a context checkpoint")
         ):
             local_compact_calls += 1
+            assert "text" not in body
             events = [
                 {"type": "response.output_text.delta", "output_index": 0, "delta": "checkpoint"},
                 {"type": "response.completed", "response": {"usage": {"input_tokens": 100}}},
             ]
         else:
+            assert body["text"]["format"]["type"] == "json_schema"
             normal_inputs.append(input_items)
             windows.append(request.headers["x-codex-window-id"])
             input_tokens = 100 if len(normal_inputs) == 1 else 10
@@ -424,7 +435,13 @@ async def test_proxy_falls_back_to_local_compact_after_remote_disconnect(monkeyp
             response = await client.post(
                 "/v1/messages",
                 headers={"anthropic-session-id": "fallback-session"},
-                json={"model": "claude-opus", "max_tokens": 10, "stream": True, "messages": messages},
+                json={
+                    "model": "claude-opus",
+                    "max_tokens": 10,
+                    "stream": True,
+                    "messages": messages,
+                    "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}},
+                },
             )
             assert response.status_code == 200
 
@@ -602,7 +619,7 @@ async def test_nonstream_marks_unreported_cache_write_usage(capsys, isolated_ins
     await upstream_client.aclose()
 
 
-async def test_streaming_backend_error_is_sse_error() -> None:
+async def test_streaming_backend_error_preserves_http_status() -> None:
     async def upstream(_: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="upstream failed")
 
@@ -616,9 +633,8 @@ async def test_streaming_backend_error_is_sse_error() -> None:
             json={"model": "claude-opus", "max_tokens": 10, "stream": True, "messages": []},
         )
 
-    assert response.status_code == 200
-    assert "event: error" in response.text
-    assert "event: message_stop" not in response.text
+    assert response.status_code == 500
+    assert response.json()["error"]["message"] == "upstream failed"
     await upstream_client.aclose()
 
 
@@ -636,7 +652,7 @@ async def test_retries_transport_disconnect_before_first_sse_event() -> None:
         }
         return httpx.Response(
             200,
-            text=f"event: response.completed\\ndata: {json.dumps(event)}\\n\\n",
+            text=f"event: response.completed\ndata: {json.dumps(event)}\n\n",
             headers={"content-type": "text/event-stream"},
         )
 
@@ -669,8 +685,8 @@ async def test_streaming_backend_429_is_rate_limit_error() -> None:
             json={"model": "claude-opus", "max_tokens": 10, "stream": True, "messages": []},
         )
 
-    assert response.status_code == 200
-    assert '"type":"rate_limit_error"' in response.text
+    assert response.status_code == 429
+    assert response.json()["error"]["type"] == "rate_limit_error"
     await upstream_client.aclose()
 
 
@@ -741,8 +757,16 @@ async def test_count_tokens_endpoint() -> None:
 async def test_stream_pings_during_upstream_gap(monkeypatch) -> None:
     monkeypatch.setattr("claude_codex.proxy.PING_INTERVAL_SECONDS", 0.02)
 
+    class PausedBody(httpx.AsyncByteStream):
+        def __init__(self, content: str) -> None:
+            self.content = content.encode()
+
+        async def __aiter__(self):
+            # Headers уже получены; reasoning задерживает только SSE body.
+            await asyncio.sleep(0.1)
+            yield self.content
+
     async def upstream(_: httpx.Request) -> httpx.Response:
-        await asyncio.sleep(0.1)  # long silent gap, as during model reasoning
         events = [
             {"type": "response.created", "response": {"id": "resp_test"}},
             {"type": "response.output_text.delta", "output_index": 0, "delta": "ok"},
@@ -755,7 +779,7 @@ async def test_stream_pings_during_upstream_gap(monkeypatch) -> None:
             f"event: {event['type']}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n"
             for event in events
         )
-        return httpx.Response(200, text=content, headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, stream=PausedBody(content), headers={"content-type": "text/event-stream"})
 
     upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
     app = create_app(auth=FakeAuth(), client=upstream_client, endpoint="https://codex.test/responses")
@@ -812,3 +836,306 @@ async def test_nonstream_failed_response_is_error() -> None:
     assert response.status_code == 502
     assert response.json()["error"]["message"] == "backend failed"
     await upstream_client.aclose()
+
+
+async def test_proxy_isolates_agents_and_forwards_open_hint_headers() -> None:
+    captured = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        captured.append((dict(request.headers), json.loads(request.content)))
+        return httpx.Response(200, text='data: {"type":"response.completed"}\n\n')
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        app = create_app(auth=FakeAuth(), client=upstream_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+        ) as client:
+            for agent in ("worker-a", "worker-b", "worker-a"):
+                response = await client.post(
+                    "/v1/messages?beta=true",
+                    headers={
+                        "X-Claude-Code-Session-Id": "shared-session",
+                        "x-claude-code-agent-id": agent,
+                        "x-claude-code-parent-agent-id": "parent",
+                        "x-claude-code-future-hint": "opaque",
+                        "authorization": "Bearer local-credential",
+                        "x-api-key": "local-key",
+                    },
+                    json={"messages": [{"role": "user", "content": "same prefix"}]},
+                )
+                assert response.status_code == 200
+
+    first, second, repeated = captured
+    assert first[0]["thread-id"] != second[0]["thread-id"]
+    assert first[0]["thread-id"] == repeated[0]["thread-id"]
+    assert first[1]["prompt_cache_key"] != second[1]["prompt_cache_key"]
+    assert first[1]["prompt_cache_key"] == repeated[1]["prompt_cache_key"]
+    assert first[0]["session-id"] == second[0]["session-id"] == "shared-session"
+    assert first[0]["x-claude-code-agent-id"] == "worker-a"
+    assert first[0]["x-claude-code-parent-agent-id"] == "parent"
+    assert first[0]["x-claude-code-future-hint"] == "opaque"
+    assert first[0]["authorization"] == "Bearer access"
+    assert "x-api-key" not in first[0]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("status", [400, 403, 404, 429, 529])
+async def test_proxy_preserves_backend_rejection_and_retry_headers(stream, status) -> None:
+    # Recovery Claude Code ищет исходную формулировку, даже в длинной ошибке.
+    message = "details " * 100 + "capability_rejected: prompt_too_long"
+    headers = {
+        "retry-after": "42",
+        "x-should-retry": "false",
+        "anthropic-ratelimit-unified-future-status": "restricted",
+        "set-cookie": "private=upstream",
+    }
+
+    def upstream(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status, json={"error": {"message": message, "code": "context_length_exceeded"}}, headers=headers
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        app = create_app(auth=FakeAuth(), client=upstream_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post("/v1/messages", json={"messages": [], "stream": stream})
+
+    assert response.status_code == status
+    assert response.json()["error"]["message"] == message
+    assert response.json()["error"]["code"] == "context_length_exceeded"
+    assert response.headers["retry-after"] == "42"
+    assert response.headers["x-should-retry"] == "false"
+    assert response.headers["anthropic-ratelimit-unified-future-status"] == "restricted"
+    assert "set-cookie" not in response.headers
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("status", [200, 429])
+async def test_response_headers_normalize_retry_date_and_keep_future_limits(stream, status) -> None:
+    def upstream(_: httpx.Request) -> httpx.Response:
+        headers = {
+            "retry-after": format_datetime(datetime.now(UTC) + timedelta(seconds=120), usegmt=True),
+            "x-should-retry": "true",
+            "anthropic-ratelimit-unified-future-reset": "123456",
+        }
+        if status == 429:
+            return httpx.Response(429, json={"error": {"message": "limited"}}, headers=headers)
+        return httpx.Response(200, text='data: {"type":"response.completed"}\n\n', headers=headers)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        app = create_app(auth=FakeAuth(), client=upstream_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post("/v1/messages", json={"messages": [], "stream": stream})
+
+    assert response.status_code == status
+    assert 119 <= int(response.headers["retry-after"]) <= 120
+    assert response.headers["x-should-retry"] == "true"
+    assert response.headers["anthropic-ratelimit-unified-future-reset"] == "123456"
+    if stream and status == 200:
+        assert response.headers["content-type"].startswith("text/event-stream")
+
+
+@pytest.mark.parametrize(
+    "feature",
+    [
+        {"safeguards": {}},
+        {"context_management": {"edits": []}},
+        {"tools": [{"type": "advisor_20260301", "name": "advisor"}]},
+        {"tools": [{"name": "Read", "defer_loading": True}]},
+        {"messages": [{"role": "user", "content": [{"type": "tool_reference", "tool_name": "Read"}]}]},
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{"type": "tool_reference", "tool_name": "Read"}],
+                        }
+                    ],
+                }
+            ]
+        },
+    ],
+)
+async def test_unsupported_anthropic_capabilities_are_rejected_before_inference(feature) -> None:
+    def upstream(_: httpx.Request) -> httpx.Response:
+        pytest.fail("Unsupported capability must not reach Codex")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        app = create_app(auth=FakeAuth(), client=upstream_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post("/v1/messages?beta=true", json={"messages": [], **feature})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    if "safeguards" in feature:
+        assert "CLAUDE_CODE_AUTO_MODE_SERVER=0" in response.json()["error"]["message"]
+    if feature.get("tools", [{}])[0].get("type") == "advisor_20260301":
+        assert "Input tag 'advisor_20260301'" in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_truncated_upstream_is_not_reported_as_a_completed_answer(stream) -> None:
+    def upstream(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text='data: {"type":"response.output_text.delta","delta":"partial"}\n\n')
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        app = create_app(auth=FakeAuth(), client=upstream_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post("/v1/messages", json={"messages": [], "stream": stream})
+
+    if stream:
+        assert "event: error" in response.text
+        assert "event: message_stop" not in response.text
+        assert "event: message_delta" not in response.text
+        assert '"stop_reason":"end_turn"' not in response.text
+    else:
+        assert response.status_code == 502
+        assert response.json()["error"]["type"] == "api_error"
+
+
+@pytest.mark.parametrize(
+    "configured, effort, expected", [(None, "high", "high"), (None, "max", "xhigh"), ("low", "high", "low")]
+)
+async def test_output_effort_is_translated_unless_backend_override_is_set(
+    monkeypatch, configured, effort, expected
+) -> None:
+    if configured is None:
+        monkeypatch.delenv("CLAUDE_CODEX_REASONING", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CODEX_REASONING", configured)
+    captured = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, text='data: {"type":"response.completed"}\n\n')
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        app = create_app(auth=FakeAuth(), client=upstream_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post(
+                "/v1/messages", json={"messages": [], "output_config": {"effort": effort}}
+            )
+    assert response.status_code == 200
+    assert captured[0]["reasoning"]["effort"] == expected
+
+
+async def test_startup_probe_and_discovery_report_only_the_configured_backend(monkeypatch) -> None:
+    monkeypatch.setenv("CLAUDE_CODEX_MODEL", "gpt-test-backend")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "anthropic-codex-alias")
+
+    def upstream(_: httpx.Request) -> httpx.Response:
+        pytest.fail("Startup endpoints must not call inference")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        app = create_app(auth=FakeAuth(), client=upstream_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+        ) as client:
+            probe = await client.head("/api/hello")
+            models = await client.get(
+                "/v1/models?limit=1000", headers={"Authorization": "Bearer local", "x-api-key": "local"}
+            )
+
+    assert probe.status_code == 204
+    assert not probe.content
+    assert models.status_code == 200
+    assert models.json()["data"] == [
+        {
+            "type": "model",
+            "id": "anthropic-codex-alias",
+            "display_name": "Codex: gpt-test-backend",
+            "description": (
+                "Routes to gpt-test-backend via the Codex subscription; "
+                "Anthropic server safeguards are unavailable."
+            ),
+        }
+    ]
+    assert models.json()["has_more"] is False
+
+
+@pytest.mark.parametrize("event_data", ["[]", "not-json"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_malformed_upstream_event_is_an_api_error(event_data, stream) -> None:
+    def upstream(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=f"data: {event_data}\n\n")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        app = create_app(auth=FakeAuth(), client=upstream_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post("/v1/messages", json={"messages": [], "stream": stream})
+    if stream:
+        assert "event: error" in response.text
+        assert "event: message_stop" not in response.text
+    else:
+        assert response.status_code == 502
+        assert response.json()["error"]["type"] == "api_error"
+
+
+async def test_delta_after_block_stop_is_not_relayed_to_claude() -> None:
+    def upstream(_: httpx.Request) -> httpx.Response:
+        events = [
+            {"type": "response.output_text.delta", "output_index": 0, "delta": "visible"},
+            {"type": "response.output_item.done", "output_index": 0, "item": {"type": "message"}},
+            {"type": "response.output_text.delta", "output_index": 0, "delta": "late-content"},
+            {"type": "response.completed"},
+        ]
+        return httpx.Response(200, text="".join(f"data: {json.dumps(event)}\n\n" for event in events))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        app = create_app(auth=FakeAuth(), client=upstream_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post("/v1/messages", json={"messages": [], "stream": True})
+    assert "event: error" in response.text
+    assert "late-content" not in response.text
+    assert response.text.count("event: content_block_stop") == 1
+    assert "event: message_stop" not in response.text
+
+
+async def test_auxiliary_classifier_does_not_reuse_main_compaction_state(monkeypatch) -> None:
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "100")
+    monkeypatch.setenv("CLAUDE_CODEX_REMOTE_COMPACT", "0")
+    captured = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        captured.append((dict(request.headers), json.loads(request.content)))
+        tokens = 100 if len(captured) <= 2 else 10
+        event = {"type": "response.completed", "response": {"usage": {"input_tokens": tokens}}}
+        return httpx.Response(200, text=f"data: {json.dumps(event)}\n\n")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        app = create_app(auth=FakeAuth(), client=upstream_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+        ) as client:
+            for request_class in ("main", "auxiliary", "auxiliary"):
+                response = await client.post(
+                    "/v1/messages",
+                    headers={
+                        "x-claude-code-session-id": "shared",
+                        "x-claude-code-request-class": request_class,
+                    },
+                    json={"messages": [{"role": "user", "content": "same history"}], "system": request_class},
+                )
+                assert response.status_code == 200
+    assert len(captured) == 3
+    assert captured[0][0]["thread-id"] != captured[1][0]["thread-id"]
+    assert captured[0][1]["prompt_cache_key"] != captured[1][1]["prompt_cache_key"]
+    assert captured[0][1]["input"] == captured[1][1]["input"]
+    assert captured[1][1]["input"] == captured[2][1]["input"]

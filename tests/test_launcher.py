@@ -221,8 +221,10 @@ def test_proxy_settings_override_routing_and_preserve_customizations(tmp_path, f
     path = tmp_path / "settings.json"
     path.write_text(raw)
     option = {
-        "absent": [], "json": ["--settings", raw],
-        "file": ["--settings", str(path)], "equals": [f"--settings={raw}"],
+        "absent": [],
+        "json": ["--settings", raw],
+        "file": ["--settings", str(path)],
+        "equals": [f"--settings={raw}"],
     }[form]
     overrides = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:1234"}
     with launcher._proxy_settings_args([*option, "-p", "hello"], overrides) as result:
@@ -270,11 +272,12 @@ def test_launcher_keeps_settings_private_and_cleans_up(monkeypatch, tmp_path, ou
     }
     original = tmp_path / "settings.json"
     original.write_text(json.dumps(settings))
-    monkeypatch.setattr(
-        launcher.sys, "argv", ["claude-codex", "--settings", str(original), "-p", "hello"]
-    )
+    monkeypatch.setattr(launcher.sys, "argv", ["claude-codex", "--settings", str(original), "-p", "hello"])
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://wrong.invalid")
     monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+    monkeypatch.setenv("CLAUDE_CODE_USE_MANTLE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_AUTO_MODE_SERVER", "1")
+    monkeypatch.setenv("CLAUDE_CODE_ATTRIBUTION_HEADER", "1")
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", f"X-Private: {header_secret}")
     captured_paths = []
 
@@ -294,6 +297,12 @@ def test_launcher_keeps_settings_private_and_cleans_up(monkeypatch, tmp_path, ou
         assert pinned["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:1234"
         assert pinned["ANTHROPIC_AUTH_TOKEN"] == "claude-codex-local"
         assert pinned["CLAUDE_CODE_USE_VERTEX"] == "0"
+        assert pinned["CLAUDE_CODE_USE_MANTLE"] == "0"
+        assert pinned["CLAUDE_CODE_AUTO_MODE_SERVER"] == "0"
+        assert pinned["CLAUDE_CODE_ATTRIBUTION_HEADER"] == "0"
+        assert pinned["CLAUDE_CODE_GATEWAY_HINT_HEADERS"] == "1"
+        assert pinned["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] == "1"
+        assert pinned["ENABLE_TOOL_SEARCH"] == "false"
         assert "X-Session-Id:" in pinned["ANTHROPIC_CUSTOM_HEADERS"]
         assert header_secret in pinned["ANTHROPIC_CUSTOM_HEADERS"]
         assert all(env[key] == value for key, value in pinned.items() if key != "MCP_SERVICE_TOKEN")

@@ -13,7 +13,28 @@ user/project settings remain enabled; explicit `--settings` JSON or files are me
 proxy overrides without modifying the source files. Merged settings are passed through a private
 temporary file (mode `0600`), keeping their contents out of process arguments; the file is removed
 when Claude exits, including on launch errors or Ctrl+C. Backend selectors for Bedrock, Vertex, and
-Foundry are disabled for this session.
+Foundry and Mantle are disabled for this session.
+
+## Gateway compatibility and auto mode
+
+The launcher uses the documented fallback for a gateway whose upstream cannot perform Anthropic
+server-side classifier review: it pins `CLAUDE_CODE_AUTO_MODE_SERVER=0` for the Claude session.
+Auto mode keeps its client-side classifier checks. Those checks become ordinary Codex inference
+requests and use the subscription's normal quota; this bridge does not provide Anthropic's
+no-charge server checks. See [classifier request charges](https://code.claude.com/docs/en/auto-mode-classifier-billing).
+
+Because the bridge converts system blocks to Responses instructions, it also pins
+`CLAUDE_CODE_ATTRIBUTION_HEADER=0` at the client. Gateway hint headers are enabled, experimental
+Anthropic capabilities are disabled, and `ENABLE_TOOL_SEARCH=false` keeps MCP tools in ordinary
+function-tool form. Existing permissions, hooks, and persistent settings files remain untouched.
+
+The proxy supports native session/agent routing, streaming with keep-alive pings, HTTP error and
+retry controls, JSON-schema structured outputs, strict function tools, effort translation, and
+`/v1/models` discovery. Discovery remains opt-in with `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`
+and reports the configured Codex backend. Token counts remain character-based estimates.
+
+See the [compatibility matrix](docs/gateway-compatibility.md) for supported behavior and limits,
+mapped to the [Claude Code gateway guide](https://code.claude.com/docs/en/llm-gateway-protocol).
 
 ## Authentication
 

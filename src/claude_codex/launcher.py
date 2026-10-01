@@ -202,6 +202,15 @@ def main() -> None:
             "CLAUDE_CODE_USE_BEDROCK": "0",
             "CLAUDE_CODE_USE_VERTEX": "0",
             "CLAUDE_CODE_USE_FOUNDRY": "0",
+            "CLAUDE_CODE_USE_MANTLE": "0",
+            # Codex не возвращает Anthropic safeguard_results; проверки остаются
+            # в клиенте Claude Code и расходуют токены подписки Codex.
+            "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
+            # Translator объединяет system blocks в Responses instructions.
+            "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+            "CLAUDE_CODE_GATEWAY_HINT_HEADERS": "1",
+            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+            "ENABLE_TOOL_SEARCH": "false",
             "DISABLE_TELEMETRY": "1",
             "DISABLE_ERROR_REPORTING": "1",
         }

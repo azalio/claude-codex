@@ -234,3 +234,26 @@ def test_translates_function_call_stream() -> None:
         {"type": "tool_use", "id": "call_1", "name": "Read", "input": {"file_path": "x"}}
     ]
     assert stream.response()["stop_reason"] == "tool_use"
+
+
+def test_translates_structured_output_and_strict_function_tools() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+    payload = {
+        "messages": [],
+        "output_config": {"format": {"type": "json_schema", "schema": schema}},
+        "tools": [{"name": "Check", "input_schema": schema, "strict": True}],
+    }
+    validate_messages_request(payload)
+    result = to_responses_request(payload, model="gpt-6.1-sol", reasoning_effort="high")
+    assert result["text"]["format"] == {
+        "type": "json_schema",
+        "name": "response",
+        "schema": schema,
+        "strict": True,
+    }
+    assert result["tools"][0]["strict"] is True

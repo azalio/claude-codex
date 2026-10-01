@@ -3,9 +3,17 @@
 Run the normal Claude Code CLI while using a ChatGPT Codex subscription as the model backend.
 
 The command starts a local Anthropic-compatible proxy, points `ANTHROPIC_BASE_URL` at it, and then
-executes the regular `claude` binary with every original argument. Claude Code keeps its UI, slash
+executes the regular `claude` binary with the supplied arguments. Claude Code keeps its UI, slash
 commands, skills, hooks, MCP servers, and tools. The proxy translates Anthropic Messages and SSE to
 the Codex Responses protocol.
+
+The launcher also pins proxy routing in session-level `--settings`, because Claude Code's
+`settings.json` environment values can override the inherited process environment. Existing
+user/project settings remain enabled; explicit `--settings` JSON or files are merged with the
+proxy overrides without modifying the source files. Merged settings are passed through a private
+temporary file (mode `0600`), keeping their contents out of process arguments; the file is removed
+when Claude exits, including on launch errors or Ctrl+C. Backend selectors for Bedrock, Vertex, and
+Foundry are disabled for this session.
 
 ## Authentication
 
@@ -19,6 +27,18 @@ No OpenAI API key is used. Credentials are loaded in this order:
 If OpenCode is already connected to ChatGPT, the third source works immediately. Refreshed
 credentials are copied to the private `claude-codex` cache with mode `0600`; OpenCode and Codex
 credential files are never modified.
+
+## TLS certificates
+
+Upstream HTTPS requests and OAuth token refreshes trust certifi's public CA bundle plus the
+Python/OpenSSL default CA store, including organization certificates installed there. The public
+bundle remains available when Python has no default CA paths. Certificate and hostname
+verification remain enabled. To replace the default trust with a custom CA bundle or OpenSSL
+certificate directory, set `SSL_CERT_FILE` or `SSL_CERT_DIR` (`SSL_CERT_FILE` takes precedence):
+
+```bash
+SSL_CERT_FILE=/path/to/ca-bundle.pem claude-codex
+```
 
 ## Install
 

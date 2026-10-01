@@ -19,6 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .auth import AuthError, AuthManager, AuthProvider
+from .tls import upstream_ssl_context
 from .translate import (
     AnthropicStream,
     encode_sse,
@@ -413,7 +414,9 @@ def create_app(
     installation_id_path: Path | None = None,
 ) -> FastAPI:
     owns_client = client is None
-    http = client or httpx.AsyncClient(timeout=httpx.Timeout(300, connect=30))
+    http = client or httpx.AsyncClient(
+        verify=upstream_ssl_context(), timeout=httpx.Timeout(300, connect=30)
+    )
     manager = auth or AuthManager(client=http)
     backend = CodexBackend(
         manager,

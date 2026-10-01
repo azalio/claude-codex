@@ -8,11 +8,13 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
 import uuid
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from io import BufferedReader
 from pathlib import Path
 
@@ -73,8 +75,9 @@ def _configure_context_identity(env: dict[str, str], model: str) -> str | None:
     return explicit or None
 
 
-def _proxy_settings_args(args: list[str], overrides: dict[str, str]) -> list[str]:
-    """Pin routing in CLI settings, which override user/project settings.env."""
+@contextmanager
+def _proxy_settings_args(args: list[str], overrides: dict[str, str]) -> Iterator[list[str]]:
+    """Хранит объединённые настройки приватно до завершения процесса Claude."""
     args = args.copy()
     settings_index = None
     inline = False
@@ -94,14 +97,18 @@ def _proxy_settings_args(args: list[str], overrides: dict[str, str]) -> list[str
         if not isinstance(settings, dict) or not isinstance(settings.get("env", {}), dict):
             raise ValueError("--settings must contain an object with an optional env object")
     settings["env"] = {**settings.get("env", {}), **overrides}
-    value = json.dumps(settings)
-    if settings_index is None:
-        return ["--settings", value, *args]
-    if inline:
-        args[settings_index] = f"--settings={value}"
-    else:
-        args[settings_index + 1] = value
-    return args
+    with tempfile.TemporaryDirectory(prefix="claude-codex-settings-") as directory:
+        path = Path(directory) / "settings.json"
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(settings, stream)
+        if settings_index is None:
+            args = ["--settings", str(path), *args]
+        elif inline:
+            args[settings_index] = f"--settings={path}"
+        else:
+            args[settings_index + 1] = str(path)
+        yield args
 
 
 def _log_max_bytes() -> int:
@@ -213,8 +220,8 @@ def main() -> None:
         overrides["ANTHROPIC_CUSTOM_HEADERS"] = env["ANTHROPIC_CUSTOM_HEADERS"]
         if context_identity:
             overrides["ANTHROPIC_MODEL"] = context_identity
-        args = _proxy_settings_args(sys.argv[1:], overrides)
-        result = subprocess.run([claude, *args], env=env)
+        with _proxy_settings_args(sys.argv[1:], overrides) as args:
+            result = subprocess.run([claude, *args], env=env)
         raise SystemExit(result.returncode)
     finally:
         _terminate(proxy)

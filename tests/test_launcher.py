@@ -225,24 +225,28 @@ def test_proxy_settings_override_routing_and_preserve_customizations(tmp_path, f
         "file": ["--settings", str(path)], "equals": [f"--settings={raw}"],
     }[form]
     overrides = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:1234"}
-    result = launcher._proxy_settings_args([*option, "-p", "hello"], overrides)
-    merged = json.loads(result[0].split("=", 1)[1] if form == "equals" else result[1])
-    assert merged["env"]["ANTHROPIC_BASE_URL"] == overrides["ANTHROPIC_BASE_URL"]
-    assert result[-2:] == ["-p", "hello"]
-    if form != "absent":
-        assert merged["env"]["MY_VARIABLE"] == "keep"
-        assert merged["hooks"] == settings["hooks"]
-        assert merged["permissions"] == settings["permissions"]
+    with launcher._proxy_settings_args([*option, "-p", "hello"], overrides) as result:
+        private = Path(result[0].split("=", 1)[1] if form == "equals" else result[1])
+        assert private.stat().st_mode & 0o777 == 0o600
+        merged = json.loads(private.read_text())
+        assert merged["env"]["ANTHROPIC_BASE_URL"] == overrides["ANTHROPIC_BASE_URL"]
+        assert result[-2:] == ["-p", "hello"]
+        if form != "absent":
+            assert merged["env"]["MY_VARIABLE"] == "keep"
+            assert merged["hooks"] == settings["hooks"]
+            assert merged["permissions"] == settings["permissions"]
+    assert not private.exists()
     assert path.read_text() == raw
 
 
 def test_proxy_settings_preserve_arguments_after_separator() -> None:
     args = ["--", "--settings", "a literal prompt"]
-    result = launcher._proxy_settings_args(args, {"ANTHROPIC_BASE_URL": "local"})
-    assert result[2:] == args
+    with launcher._proxy_settings_args(args, {"ANTHROPIC_BASE_URL": "local"}) as result:
+        assert result[2:] == args
 
 
-def test_launcher_pins_proxy_in_environment_and_settings(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("outcome", ["exit", "error", "interrupt"])
+def test_launcher_keeps_settings_private_and_cleans_up(monkeypatch, tmp_path, outcome) -> None:
     import io
 
     monkeypatch.setattr(launcher.shutil, "which", lambda _: "/bin/claude")
@@ -257,21 +261,54 @@ def test_launcher_pins_proxy_in_environment_and_settings(monkeypatch, tmp_path) 
     monkeypatch.setattr(launcher, "_wait", lambda *a: None)
     monkeypatch.setattr(launcher, "_terminate", lambda *a: None)
     monkeypatch.setattr(launcher.atexit, "register", lambda *a: None)
-    monkeypatch.setattr(launcher.sys, "argv", ["claude-codex", "-p", "hello"])
+    secret = "synthetic-service-token"
+    header_secret = "synthetic-header-token"
+    settings = {
+        "env": {"MCP_SERVICE_TOKEN": secret},
+        "hooks": {"SessionStart": []},
+        "permissions": {"allow": ["Read"]},
+    }
+    original = tmp_path / "settings.json"
+    original.write_text(json.dumps(settings))
+    monkeypatch.setattr(
+        launcher.sys, "argv", ["claude-codex", "--settings", str(original), "-p", "hello"]
+    )
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://wrong.invalid")
     monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
-    run = Mock(return_value=Mock(returncode=7))
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", f"X-Private: {header_secret}")
+    captured_paths = []
+
+    def run(command, *, env):
+        assert command[0:2] == ["/bin/claude", "--settings"]
+        assert command[-2:] == ["-p", "hello"]
+        assert not any(secret in arg or header_secret in arg for arg in command)
+        private = Path(command[2])
+        captured_paths.append(private)
+        assert private.is_file()
+        assert private.stat().st_mode & 0o777 == 0o600
+        merged = json.loads(private.read_text())
+        pinned = merged["env"]
+        assert pinned["MCP_SERVICE_TOKEN"] == secret
+        assert merged["hooks"] == settings["hooks"]
+        assert merged["permissions"] == settings["permissions"]
+        assert pinned["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:1234"
+        assert pinned["ANTHROPIC_AUTH_TOKEN"] == "claude-codex-local"
+        assert pinned["CLAUDE_CODE_USE_VERTEX"] == "0"
+        assert "X-Session-Id:" in pinned["ANTHROPIC_CUSTOM_HEADERS"]
+        assert header_secret in pinned["ANTHROPIC_CUSTOM_HEADERS"]
+        assert all(env[key] == value for key, value in pinned.items() if key != "MCP_SERVICE_TOKEN")
+        if outcome == "error":
+            raise RuntimeError("synthetic launch failure")
+        if outcome == "interrupt":
+            raise KeyboardInterrupt
+        return Mock(returncode=7)
+
     monkeypatch.setattr(launcher.subprocess, "run", run)
-    with pytest.raises(SystemExit) as exc:
+    expected = {"exit": SystemExit, "error": RuntimeError, "interrupt": KeyboardInterrupt}[outcome]
+    with pytest.raises(expected) as exc:
         launcher.main()
-    assert exc.value.code == 7
-    command = run.call_args.args[0]
-    env = run.call_args.kwargs["env"]
-    pinned = json.loads(command[2])["env"]
-    assert command[0:2] == ["/bin/claude", "--settings"]
-    assert command[-2:] == ["-p", "hello"]
-    assert pinned["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:1234"
-    assert pinned["ANTHROPIC_AUTH_TOKEN"] == "claude-codex-local"
-    assert pinned["CLAUDE_CODE_USE_VERTEX"] == "0"
-    assert "X-Session-Id:" in pinned["ANTHROPIC_CUSTOM_HEADERS"]
-    assert all(env[key] == value for key, value in pinned.items())
+    if outcome == "exit":
+        assert exc.value.code == 7
+    assert len(captured_paths) == 1
+    assert not captured_paths[0].exists()
+    assert json.loads(original.read_text()) == settings

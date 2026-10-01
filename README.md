@@ -10,7 +10,9 @@ the Codex Responses protocol.
 The launcher also pins proxy routing in session-level `--settings`, because Claude Code's
 `settings.json` environment values can override the inherited process environment. Existing
 user/project settings remain enabled; explicit `--settings` JSON or files are merged with the
-proxy overrides without modifying the source files. Backend selectors for Bedrock, Vertex, and
+proxy overrides without modifying the source files. Merged settings are passed through a private
+temporary file (mode `0600`), keeping their contents out of process arguments; the file is removed
+when Claude exits, including on launch errors or Ctrl+C. Backend selectors for Bedrock, Vertex, and
 Foundry are disabled for this session.
 
 ## Authentication

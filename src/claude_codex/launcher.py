@@ -13,8 +13,8 @@ import time
 import urllib.request
 import uuid
 from contextlib import suppress
+from io import BufferedReader
 from pathlib import Path
-from typing import BinaryIO
 
 DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
 
@@ -67,8 +67,8 @@ def _configure_context_identity(env: dict[str, str], model: str) -> str | None:
     explicit = env.get("ANTHROPIC_MODEL")
     if explicit:
         return explicit
-    if model == "gpt-5.6" or model.startswith("gpt-5.6-"):
-        env["ANTHROPIC_MODEL"] = "claude-opus-4-8"
+    if model == "gpt-6.1" or model.startswith("gpt-6.1-"):
+        env["ANTHROPIC_MODEL"] = "claude-opus-5-5"
         return env["ANTHROPIC_MODEL"]
     return None
 
@@ -107,7 +107,7 @@ def _append_rotated_log(log_path: Path, data: bytes, *, max_bytes: int) -> None:
         data = data[chunk_size:]
 
 
-def _drain_proxy_output(source: BinaryIO, log_path: Path, *, max_bytes: int) -> None:
+def _drain_proxy_output(source: BufferedReader, log_path: Path, *, max_bytes: int) -> None:
     with source:
         while chunk := source.read1(8192):
             _append_rotated_log(log_path, chunk, max_bytes=max_bytes)
@@ -165,7 +165,7 @@ def main() -> None:
         header = f"X-Session-Id: {session_id}"
         existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
         env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header}" if existing else header
-        model = env.get("CLAUDE_CODEX_MODEL", "gpt-5.6-sol")
+        model = env.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
         context_identity = _configure_context_identity(env, model)
         context_note = f"; Claude context {context_identity}" if context_identity else ""
         print(

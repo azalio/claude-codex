@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -37,6 +38,7 @@ def test_remote_compact_is_opt_in(monkeypatch) -> None:
 
 async def test_proxy_streams_anthropic_events(monkeypatch) -> None:
     monkeypatch.delenv("CLAUDE_CODEX_MODEL", raising=False)
+    monkeypatch.delenv("CLAUDE_CODEX_REASONING", raising=False)
     captured: dict = {}
 
     async def upstream(request: httpx.Request) -> httpx.Response:
@@ -88,7 +90,8 @@ async def test_proxy_streams_anthropic_events(monkeypatch) -> None:
     assert captured["thread"]
     assert captured["installation"]
     assert captured["window"]
-    assert captured["body"]["model"] == "gpt-5.6-sol"
+    assert captured["body"]["model"] == "gpt-6.1-sol"
+    assert captured["body"]["reasoning"] == {"effort": "xhigh", "summary": "auto"}
     assert captured["body"]["prompt_cache_key"] == "session-test"
     assert captured["body"]["client_metadata"] == {
         "x-codex-installation-id": captured["installation"],
@@ -187,7 +190,7 @@ async def test_proxy_reuses_complete_codex_cache_identity_for_claude_session() -
     the second request into a miss.
     """
 
-    captured: list[dict[str, object]] = []
+    captured: list[dict[str, dict[str, Any]]] = []
     warmed_cache_keys: set[tuple[str, ...]] = set()
 
     async def upstream(request: httpx.Request) -> httpx.Response:
@@ -333,7 +336,7 @@ async def test_proxy_compacts_context_and_reuses_replacement_history(monkeypatch
         {"role": "assistant", "content": [{"type": "output_text", "text": "answer one"}]},
         {"role": "user", "content": [{"type": "input_text", "text": "second"}]},
     ]
-    assert compact_inputs[0]["model"] == "gpt-5.6-sol"
+    assert compact_inputs[0]["model"] == "gpt-6.1-sol"
     assert compact_inputs[0]["prompt_cache_key"] == "compact-session"
     assert normal_inputs[2] == usable_replacement_history + [
         {"role": "assistant", "content": [{"type": "output_text", "text": "answer two"}]},

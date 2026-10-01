@@ -613,7 +613,7 @@ def create_app(
             f"threshold={compact_at_tokens}",
             flush=True,
         )
-        replacement_history: list[dict[str, Any]]
+        replacement_history: list[dict[str, Any]] = []
         implementation = "remote"
         if remote_compact_enabled and remote_compact_available.get(session_key, True):
             try:
@@ -683,8 +683,8 @@ def create_app(
         if isinstance(body, JSONResponse):
             return body
         requested_model = str(body.get("model") or "claude-codex")
-        codex_model = os.environ.get("CLAUDE_CODEX_MODEL", "gpt-5.6-sol")
-        reasoning = os.environ.get("CLAUDE_CODEX_REASONING", "medium")
+        codex_model = os.environ.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
+        reasoning = os.environ.get("CLAUDE_CODEX_REASONING", "xhigh")
         session_source, session_id = request_session_identity(request)
         session_identity = identity_for(session_source, session_id)
         upstream = to_responses_request(

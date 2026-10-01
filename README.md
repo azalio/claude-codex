@@ -45,8 +45,8 @@ claude-codex --continue
 Configuration:
 
 ```bash
-CLAUDE_CODEX_MODEL=gpt-5.6-sol claude-codex
-CLAUDE_CODEX_REASONING=high claude-codex
+CLAUDE_CODEX_MODEL=gpt-6.1-sol claude-codex
+CLAUDE_CODEX_REASONING=xhigh claude-codex
 CLAUDE_CODEX_LOG_MAX_BYTES=10485760 claude-codex
 CLAUDE_CODEX_COMPACT_AT=200000 claude-codex
 # Optional experimental native endpoint; local compact is the safe default.

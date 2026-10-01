@@ -29,7 +29,7 @@ from .translate import (
 
 CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
 INSTALLATION_ID_PATH = Path.home() / ".config" / "claude-codex" / "installation_id"
-DEFAULT_COMPACT_AT_TOKENS = 200_000
+DEFAULT_COMPACT_AT_TOKENS = 900_000
 LOCAL_COMPACTION_RETAINED_USER_TOKENS = 20_000
 MAX_COMPACTION_BRANCHES_PER_SESSION = 8
 LOCAL_COMPACTION_PROMPT = """You are performing a context checkpoint compaction.

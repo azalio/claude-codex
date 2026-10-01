@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from claude_codex.auth import Tokens
-from claude_codex.proxy import _remote_compact_enabled, create_app
+from claude_codex.proxy import _compact_at_tokens, _remote_compact_enabled, create_app
 
 
 @pytest.fixture(autouse=True)
@@ -27,6 +27,23 @@ class FakeAuth:
 
     def load(self) -> Tokens:
         return Tokens("access", "refresh", int(time.time() * 1000) + 60_000, "acc-123", "test")
+
+
+@pytest.mark.parametrize("value", [None, "invalid"])
+def test_compact_at_tokens_defaults_to_900k(monkeypatch, value) -> None:
+    if value is None:
+        monkeypatch.delenv("CLAUDE_CODEX_COMPACT_AT", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", value)
+
+    assert _compact_at_tokens() == 900_000
+
+
+@pytest.mark.parametrize("value, expected", [("0", 0), ("-1", 0), ("123456", 123_456)])
+def test_compact_at_tokens_preserves_overrides(monkeypatch, value, expected) -> None:
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", value)
+
+    assert _compact_at_tokens() == expected
 
 
 def test_remote_compact_is_opt_in(monkeypatch) -> None:

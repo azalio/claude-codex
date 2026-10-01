@@ -65,12 +65,12 @@ def _terminate(proxy: subprocess.Popen, grace: float = 3.0) -> None:
 
 def _configure_context_identity(env: dict[str, str], model: str) -> str | None:
     explicit = env.get("ANTHROPIC_MODEL")
-    if explicit:
-        return explicit
-    if model == "gpt-6.1" or model.startswith("gpt-6.1-"):
-        env["ANTHROPIC_MODEL"] = "claude-opus-5-5"
+    if (not explicit or explicit == "claude-opus-5-5") and (
+        model == "gpt-6.1" or model.startswith("gpt-6.1-")
+    ):
+        env["ANTHROPIC_MODEL"] = "claude-opus-5-5[1m]"
         return env["ANTHROPIC_MODEL"]
-    return None
+    return explicit or None
 
 
 def _log_max_bytes() -> int:

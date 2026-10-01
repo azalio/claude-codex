@@ -49,22 +49,25 @@ class Response:
         return json.dumps({"startup_id": self.startup_id}).encode()
 
 
-def test_gpt_6_1_uses_standard_claude_context_identity() -> None:
-    env: dict[str, str] = {}
+@pytest.mark.parametrize("inherited", [None, "", "claude-opus-5-5"])
+@pytest.mark.parametrize("model", ["gpt-6.1", "gpt-6.1-sol"])
+def test_gpt_6_1_uses_1m_claude_context_identity(inherited: str | None, model: str) -> None:
+    env = {} if inherited is None else {"ANTHROPIC_MODEL": inherited}
 
-    result = launcher._configure_context_identity(env, "gpt-6.1-sol")
+    result = launcher._configure_context_identity(env, model)
 
-    assert result == "claude-opus-5-5"
+    assert result == "claude-opus-5-5[1m]"
     assert env["ANTHROPIC_MODEL"] == result
 
 
-def test_context_identity_preserves_explicit_model() -> None:
-    env = {"ANTHROPIC_MODEL": "claude-custom"}
+@pytest.mark.parametrize("model", ["claude-custom", "claude-opus-5-5[1m]"])
+def test_context_identity_preserves_explicit_model(model: str) -> None:
+    env = {"ANTHROPIC_MODEL": model}
 
     result = launcher._configure_context_identity(env, "gpt-6.1-sol")
 
-    assert result == "claude-custom"
-    assert env["ANTHROPIC_MODEL"] == "claude-custom"
+    assert result == model
+    assert env["ANTHROPIC_MODEL"] == model
 
 
 def test_other_upstream_models_do_not_set_claude_context_identity() -> None:
@@ -72,6 +75,13 @@ def test_other_upstream_models_do_not_set_claude_context_identity() -> None:
 
     assert launcher._configure_context_identity(env, "gpt-5.4") is None
     assert "ANTHROPIC_MODEL" not in env
+
+
+def test_other_upstream_models_preserve_bare_claude_context_identity() -> None:
+    env = {"ANTHROPIC_MODEL": "claude-opus-5-5"}
+
+    assert launcher._configure_context_identity(env, "gpt-5.4") == "claude-opus-5-5"
+    assert env["ANTHROPIC_MODEL"] == "claude-opus-5-5"
 
 
 def test_log_max_bytes_uses_default_for_invalid_values(monkeypatch) -> None:

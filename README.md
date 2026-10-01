@@ -48,15 +48,25 @@ Configuration:
 CLAUDE_CODEX_MODEL=gpt-6.1-sol claude-codex
 CLAUDE_CODEX_REASONING=xhigh claude-codex
 CLAUDE_CODEX_LOG_MAX_BYTES=10485760 claude-codex
-CLAUDE_CODEX_COMPACT_AT=200000 claude-codex
+CLAUDE_CODEX_COMPACT_AT=900000 claude-codex
 # Optional experimental native endpoint; local compact is the safe default.
 CLAUDE_CODEX_REMOTE_COMPACT=1 claude-codex
 ```
 
+For GPT-6.1 backends, the launcher uses `ANTHROPIC_MODEL=claude-opus-5-5[1m]` to give
+Claude Code a 1,000,000-token client context window. It also upgrades an inherited bare
+`claude-opus-5-5` identity; other explicit model identities are preserved. This changes the
+client's context accounting, not the actual Codex backend model. A forwarded `--model` option
+or an in-session `/model` selection overrides this identity. `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`
+limits the client to 200,000 tokens even with `[1m]`; leave it unset for the larger window.
+
 `proxy.log` is rotated to one `proxy.log.1` backup when it reaches 10 MiB. Set
 `CLAUDE_CODEX_LOG_MAX_BYTES` to a positive byte limit to override that threshold.
 
-When a completed upstream turn reports at least 200,000 input tokens, the next turn in that
+The default compaction threshold is 900,000 input tokens, leaving 150,000 tokens below the
+[OpenRouter-listed 1,050,000-token context window](https://openrouter.ai/openai/gpt-6.1-sol).
+The Codex subscription endpoint's serving limit has not been verified separately.
+When a completed upstream turn reports at least 900,000 input tokens, the next turn in that
 native Claude session is compacted locally: the proxy creates a concise handoff summary through
 ordinary `/responses`, retains recent user messages, and continues without exposing an internal
 error to Claude Code. The proxy stores replacement history only in memory, advances that branch's

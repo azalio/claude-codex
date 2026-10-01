@@ -26,6 +26,16 @@ If OpenCode is already connected to ChatGPT, the third source works immediately.
 credentials are copied to the private `claude-codex` cache with mode `0600`; OpenCode and Codex
 credential files are never modified.
 
+## TLS certificates
+
+Upstream HTTPS requests and OAuth token refreshes use the system CA trust store, including
+locally installed organization certificates. Certificate and hostname verification remain enabled.
+To supply a custom CA bundle or OpenSSL certificate directory, set `SSL_CERT_FILE` or `SSL_CERT_DIR`:
+
+```bash
+SSL_CERT_FILE=/path/to/ca-bundle.pem claude-codex
+```
+
 ## Install
 
 ```bash

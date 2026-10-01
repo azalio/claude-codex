@@ -5,6 +5,7 @@ import base64
 import fcntl
 import json
 import os
+import ssl
 import tempfile
 import time
 from collections.abc import Mapping
@@ -250,7 +251,7 @@ class AuthManager:
         if not current.refresh:
             raise AuthError(f"OAuth credentials from {current.source} expired and contain no refresh token")
         owns_client = self._client is None
-        client = self._client or httpx.AsyncClient(timeout=30)
+        client = self._client or httpx.AsyncClient(verify=ssl.create_default_context(), timeout=30)
         try:
             response = await client.post(
                 f"{self.issuer}/oauth/token",

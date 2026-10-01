@@ -6,6 +6,7 @@ import copy
 import fcntl
 import json
 import os
+import ssl
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -413,7 +414,9 @@ def create_app(
     installation_id_path: Path | None = None,
 ) -> FastAPI:
     owns_client = client is None
-    http = client or httpx.AsyncClient(timeout=httpx.Timeout(300, connect=30))
+    http = client or httpx.AsyncClient(
+        verify=ssl.create_default_context(), timeout=httpx.Timeout(300, connect=30)
+    )
     manager = auth or AuthManager(client=http)
     backend = CodexBackend(
         manager,

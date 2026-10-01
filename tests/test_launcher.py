@@ -208,3 +208,70 @@ def test_terminate_force_kills_despite_interrupt(monkeypatch) -> None:
     finally:
         with suppress(ProcessLookupError):
             os.killpg(proxy.pid, signal.SIGKILL)
+
+
+@pytest.mark.parametrize("form", ["absent", "json", "file", "equals"])
+def test_proxy_settings_override_routing_and_preserve_customizations(tmp_path, form) -> None:
+    settings = {
+        "env": {"ANTHROPIC_BASE_URL": "https://wrong.invalid", "MY_VARIABLE": "keep"},
+        "hooks": {"SessionStart": []},
+        "permissions": {"allow": ["Read"]},
+    }
+    raw = json.dumps(settings)
+    path = tmp_path / "settings.json"
+    path.write_text(raw)
+    option = {
+        "absent": [], "json": ["--settings", raw],
+        "file": ["--settings", str(path)], "equals": [f"--settings={raw}"],
+    }[form]
+    overrides = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:1234"}
+    result = launcher._proxy_settings_args([*option, "-p", "hello"], overrides)
+    merged = json.loads(result[0].split("=", 1)[1] if form == "equals" else result[1])
+    assert merged["env"]["ANTHROPIC_BASE_URL"] == overrides["ANTHROPIC_BASE_URL"]
+    assert result[-2:] == ["-p", "hello"]
+    if form != "absent":
+        assert merged["env"]["MY_VARIABLE"] == "keep"
+        assert merged["hooks"] == settings["hooks"]
+        assert merged["permissions"] == settings["permissions"]
+    assert path.read_text() == raw
+
+
+def test_proxy_settings_preserve_arguments_after_separator() -> None:
+    args = ["--", "--settings", "a literal prompt"]
+    result = launcher._proxy_settings_args(args, {"ANTHROPIC_BASE_URL": "local"})
+    assert result[2:] == args
+
+
+def test_launcher_pins_proxy_in_environment_and_settings(monkeypatch, tmp_path) -> None:
+    import io
+
+    monkeypatch.setattr(launcher.shutil, "which", lambda _: "/bin/claude")
+    monkeypatch.setattr(launcher.Path, "home", lambda: tmp_path)
+    listener = Mock()
+    listener.getsockname.return_value = ("127.0.0.1", 1234)
+    listener.fileno.return_value = 42
+    monkeypatch.setattr(launcher, "_listen_socket", lambda _: listener)
+    proxy = Mock()
+    proxy.stdout = io.BytesIO()
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **kw: proxy)
+    monkeypatch.setattr(launcher, "_wait", lambda *a: None)
+    monkeypatch.setattr(launcher, "_terminate", lambda *a: None)
+    monkeypatch.setattr(launcher.atexit, "register", lambda *a: None)
+    monkeypatch.setattr(launcher.sys, "argv", ["claude-codex", "-p", "hello"])
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://wrong.invalid")
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+    run = Mock(return_value=Mock(returncode=7))
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+    with pytest.raises(SystemExit) as exc:
+        launcher.main()
+    assert exc.value.code == 7
+    command = run.call_args.args[0]
+    env = run.call_args.kwargs["env"]
+    pinned = json.loads(command[2])["env"]
+    assert command[0:2] == ["/bin/claude", "--settings"]
+    assert command[-2:] == ["-p", "hello"]
+    assert pinned["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:1234"
+    assert pinned["ANTHROPIC_AUTH_TOKEN"] == "claude-codex-local"
+    assert pinned["CLAUDE_CODE_USE_VERTEX"] == "0"
+    assert "X-Session-Id:" in pinned["ANTHROPIC_CUSTOM_HEADERS"]
+    assert all(env[key] == value for key, value in pinned.items())

@@ -3,9 +3,15 @@
 Run the normal Claude Code CLI while using a ChatGPT Codex subscription as the model backend.
 
 The command starts a local Anthropic-compatible proxy, points `ANTHROPIC_BASE_URL` at it, and then
-executes the regular `claude` binary with every original argument. Claude Code keeps its UI, slash
+executes the regular `claude` binary with the supplied arguments. Claude Code keeps its UI, slash
 commands, skills, hooks, MCP servers, and tools. The proxy translates Anthropic Messages and SSE to
 the Codex Responses protocol.
+
+The launcher also pins proxy routing in session-level `--settings`, because Claude Code's
+`settings.json` environment values can override the inherited process environment. Existing
+user/project settings remain enabled; explicit `--settings` JSON or files are merged with the
+proxy overrides without modifying the source files. Backend selectors for Bedrock, Vertex, and
+Foundry are disabled for this session.
 
 ## Authentication
 

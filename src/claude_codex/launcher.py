@@ -73,6 +73,37 @@ def _configure_context_identity(env: dict[str, str], model: str) -> str | None:
     return explicit or None
 
 
+def _proxy_settings_args(args: list[str], overrides: dict[str, str]) -> list[str]:
+    """Pin routing in CLI settings, which override user/project settings.env."""
+    args = args.copy()
+    settings_index = None
+    inline = False
+    for index, arg in enumerate(args):
+        if arg == "--":
+            break
+        if arg == "--settings":
+            settings_index, inline = index, False
+        elif arg.startswith("--settings="):
+            settings_index, inline = index, True
+    settings = {}
+    if settings_index is not None:
+        if not inline and settings_index + 1 == len(args):
+            raise ValueError("--settings requires a file path or JSON object")
+        raw = args[settings_index].split("=", 1)[1] if inline else args[settings_index + 1]
+        settings = json.loads(raw if raw.lstrip().startswith("{") else Path(raw).read_text())
+        if not isinstance(settings, dict) or not isinstance(settings.get("env", {}), dict):
+            raise ValueError("--settings must contain an object with an optional env object")
+    settings["env"] = {**settings.get("env", {}), **overrides}
+    value = json.dumps(settings)
+    if settings_index is None:
+        return ["--settings", value, *args]
+    if inline:
+        args[settings_index] = f"--settings={value}"
+    else:
+        args[settings_index + 1] = value
+    return args
+
+
 def _log_max_bytes() -> int:
     raw = os.environ.get("CLAUDE_CODEX_LOG_MAX_BYTES")
     try:
@@ -157,10 +188,17 @@ def main() -> None:
     try:
         _wait(port, proxy, log_path, startup_id)
         env = os.environ.copy()
-        env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
-        env["ANTHROPIC_AUTH_TOKEN"] = "claude-codex-local"
-        env["DISABLE_TELEMETRY"] = "1"
-        env["DISABLE_ERROR_REPORTING"] = "1"
+        overrides = {
+            "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
+            "ANTHROPIC_AUTH_TOKEN": "claude-codex-local",
+            "ANTHROPIC_API_KEY": "claude-codex-local",
+            "CLAUDE_CODE_USE_BEDROCK": "0",
+            "CLAUDE_CODE_USE_VERTEX": "0",
+            "CLAUDE_CODE_USE_FOUNDRY": "0",
+            "DISABLE_TELEMETRY": "1",
+            "DISABLE_ERROR_REPORTING": "1",
+        }
+        env.update(overrides)
         session_id = str(uuid.uuid4())
         header = f"X-Session-Id: {session_id}"
         existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
@@ -172,7 +210,11 @@ def main() -> None:
             f"Claude Code → Codex subscription ({model}){context_note}; proxy 127.0.0.1:{port}",
             file=sys.stderr,
         )
-        result = subprocess.run([claude, *sys.argv[1:]], env=env)
+        overrides["ANTHROPIC_CUSTOM_HEADERS"] = env["ANTHROPIC_CUSTOM_HEADERS"]
+        if context_identity:
+            overrides["ANTHROPIC_MODEL"] = context_identity
+        args = _proxy_settings_args(sys.argv[1:], overrides)
+        result = subprocess.run([claude, *args], env=env)
         raise SystemExit(result.returncode)
     finally:
         _terminate(proxy)

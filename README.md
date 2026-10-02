@@ -83,6 +83,11 @@ claude-codex -p "Explain this repository"
 claude-codex --continue
 ```
 
+Reasoning defaults to `medium`. The launcher pins this default in the gateway so
+Claude Code's implicit effort does not raise it. Set `CLAUDE_CODEX_REASONING`
+to choose another level; it takes precedence over the client effort. Restart
+`claude-codex` to apply a changed default or override to an existing session.
+
 Configuration:
 
 ```bash

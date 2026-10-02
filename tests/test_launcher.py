@@ -247,8 +247,13 @@ def test_proxy_settings_preserve_arguments_after_separator() -> None:
         assert result[2:] == args
 
 
+@pytest.mark.parametrize(
+    "configured, expected_reasoning", [(None, "medium"), ("", "medium"), ("xhigh", "xhigh")]
+)
 @pytest.mark.parametrize("outcome", ["exit", "error", "interrupt"])
-def test_launcher_keeps_settings_private_and_cleans_up(monkeypatch, tmp_path, outcome) -> None:
+def test_launcher_keeps_settings_private_and_cleans_up(
+    monkeypatch, tmp_path, outcome, configured, expected_reasoning
+) -> None:
     import io
 
     monkeypatch.setattr(launcher.shutil, "which", lambda _: "/bin/claude")
@@ -259,7 +264,16 @@ def test_launcher_keeps_settings_private_and_cleans_up(monkeypatch, tmp_path, ou
     monkeypatch.setattr(launcher, "_listen_socket", lambda _: listener)
     proxy = Mock()
     proxy.stdout = io.BytesIO()
-    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **kw: proxy)
+    if configured is None:
+        monkeypatch.delenv("CLAUDE_CODEX_REASONING", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CODEX_REASONING", configured)
+
+    def start_proxy(*args, **kwargs):
+        assert kwargs["env"]["CLAUDE_CODEX_REASONING"] == expected_reasoning
+        return proxy
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", start_proxy)
     monkeypatch.setattr(launcher, "_wait", lambda *a: None)
     monkeypatch.setattr(launcher, "_terminate", lambda *a: None)
     monkeypatch.setattr(launcher.atexit, "register", lambda *a: None)
@@ -282,6 +296,7 @@ def test_launcher_keeps_settings_private_and_cleans_up(monkeypatch, tmp_path, ou
     captured_paths = []
 
     def run(command, *, env):
+        assert env["CLAUDE_CODEX_REASONING"] == expected_reasoning
         assert command[0:2] == ["/bin/claude", "--settings"]
         assert command[-2:] == ["-p", "hello"]
         assert not any(secret in arg or header_secret in arg for arg in command)

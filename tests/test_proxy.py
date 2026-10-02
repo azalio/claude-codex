@@ -110,7 +110,7 @@ async def test_proxy_streams_anthropic_events(monkeypatch) -> None:
     assert captured["installation"]
     assert captured["window"]
     assert captured["body"]["model"] == "gpt-6.1-sol"
-    assert captured["body"]["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+    assert captured["body"]["reasoning"] == {"effort": "medium", "summary": "auto"}
     assert captured["body"]["prompt_cache_key"] == "session-test"
     assert captured["body"]["client_metadata"] == {
         "x-codex-installation-id": captured["installation"],
@@ -1005,7 +1005,17 @@ async def test_truncated_upstream_is_not_reported_as_a_completed_answer(stream) 
 
 
 @pytest.mark.parametrize(
-    "configured, effort, expected", [(None, "high", "high"), (None, "max", "xhigh"), ("low", "high", "low")]
+    "configured, effort, expected",
+    [
+        (None, None, "medium"),
+        ("", None, "medium"),
+        (None, "medium", "medium"),
+        (None, "high", "high"),
+        (None, "max", "xhigh"),
+        ("medium", "max", "medium"),
+        ("xhigh", "medium", "xhigh"),
+        ("low", "high", "low"),
+    ],
 )
 async def test_output_effort_is_translated_unless_backend_override_is_set(
     monkeypatch, configured, effort, expected
@@ -1025,9 +1035,10 @@ async def test_output_effort_is_translated_unless_backend_override_is_set(
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
         ) as client:
-            response = await client.post(
-                "/v1/messages", json={"messages": [], "output_config": {"effort": effort}}
-            )
+            body = {"messages": []}
+            if effort is not None:
+                body["output_config"] = {"effort": effort}
+            response = await client.post("/v1/messages", json=body)
     assert response.status_code == 200
     assert captured[0]["reasoning"]["effort"] == expected
 

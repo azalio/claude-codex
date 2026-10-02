@@ -162,6 +162,9 @@ def main() -> None:
     log_path = state / "proxy.log"
     log_max_bytes = _log_max_bytes()
     startup_id = uuid.uuid4().hex
+    proxy_env = os.environ.copy()
+    # Claude Code may send its own implicit max effort; pin the gateway default.
+    proxy_env["CLAUDE_CODEX_REASONING"] = proxy_env.get("CLAUDE_CODEX_REASONING") or "medium"
     try:
         proxy = subprocess.Popen(
             [
@@ -173,6 +176,7 @@ def main() -> None:
                 "--startup-id",
                 startup_id,
             ],
+            env=proxy_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -194,8 +198,9 @@ def main() -> None:
     atexit.register(_terminate, proxy)
     try:
         _wait(port, proxy, log_path, startup_id)
-        env = os.environ.copy()
+        env = proxy_env.copy()
         overrides = {
+            "CLAUDE_CODEX_REASONING": env["CLAUDE_CODEX_REASONING"],
             "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
             "ANTHROPIC_AUTH_TOKEN": "claude-codex-local",
             "ANTHROPIC_API_KEY": "claude-codex-local",

@@ -990,7 +990,7 @@ def create_app(
             return body
         requested_model = str(body.get("model") or "claude-codex")
         codex_model = os.environ.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
-        requested_effort = (body.get("output_config") or {}).get("effort", "xhigh")
+        requested_effort = (body.get("output_config") or {}).get("effort", "medium")
         reasoning = os.environ.get("CLAUDE_CODEX_REASONING") or (
             "xhigh" if requested_effort == "max" else requested_effort
         )

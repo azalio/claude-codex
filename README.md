@@ -89,34 +89,55 @@ Configuration:
 CLAUDE_CODEX_MODEL=gpt-6.1-sol claude-codex
 CLAUDE_CODEX_REASONING=xhigh claude-codex
 CLAUDE_CODEX_LOG_MAX_BYTES=10485760 claude-codex
-CLAUDE_CODEX_COMPACT_AT=900000 claude-codex
+CLAUDE_CODEX_COMPACT_AT=180000 claude-codex
 # Optional experimental native endpoint; local compact is the safe default.
 CLAUDE_CODEX_REMOTE_COMPACT=1 claude-codex
 ```
 
-For GPT-6.1 backends, the launcher uses `ANTHROPIC_MODEL=claude-opus-5-5[1m]` to give
-Claude Code a 1,000,000-token client context window. It also upgrades an inherited bare
-`claude-opus-5-5` identity; other explicit model identities are preserved. This changes the
-client's context accounting, not the actual Codex backend model. A forwarded `--model` option
-or an in-session `/model` selection overrides this identity. `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`
-limits the client to 200,000 tokens even with `[1m]`; leave it unset for the larger window.
+For GPT-6.1 backends, the launcher defaults to `ANTHROPIC_MODEL=claude-opus-5-5`,
+giving Claude Code a conservative 200,000-token client context window. Explicit model identities,
+a forwarded `--model` option, and an in-session `/model` selection remain user overrides.
+The Codex subscription models endpoint verified on 2026-10-02 reported `context_window=272000`
+and `max_context_window=872000` for `gpt-6.1-sol`. A public catalog's context window is not
+proof of the subscription serving limit; the launcher no longer automatically advertises `[1m]`.
 
 `proxy.log` is rotated to one `proxy.log.1` backup when it reaches 10 MiB. Set
 `CLAUDE_CODEX_LOG_MAX_BYTES` to a positive byte limit to override that threshold.
 
-The default compaction threshold is 900,000 input tokens, leaving 150,000 tokens below the
-[OpenRouter-listed 1,050,000-token context window](https://openrouter.ai/openai/gpt-6.1-sol).
-The Codex subscription endpoint's serving limit has not been verified separately.
-When a completed upstream turn reports at least 900,000 input tokens, the next turn in that
-native Claude session is compacted locally: the proxy creates a concise handoff summary through
-ordinary `/responses`, retains recent user messages, and continues without exposing an internal
-error to Claude Code. The proxy stores replacement history only in memory, advances that branch's
+The default compaction threshold is 180,000 input tokens, leaving room below the client's
+200,000-token window and the subscription's advertised default context. Before each eligible turn,
+the proxy checks both the previous upstream token usage and a character-based estimate of the
+current effective input, instructions, and tool schemas. This also covers restored histories and
+new tool outputs; the estimate is not an exact tokenizer count. When either value reaches the
+threshold, the proxy creates a concise handoff summary through
+ordinary `/responses`, retains recent user messages, and continues with the reduced history.
+The proxy stores replacement history only in memory, advances that branch's
 Codex context window, and forwards the following turn with the compacted prefix. Parallel histories
 that share one launcher session are tracked separately by their message-prefix branch. Set
 `CLAUDE_CODEX_COMPACT_AT=0` to disable this behavior or a positive token threshold to change it.
 `/responses/compact` is available only as the opt-in experiment `CLAUDE_CODEX_REMOTE_COMPACT=1`:
 its output contract currently differs from the proxy's Anthropic translation. Compaction events are
 written to `proxy.log` as `codex_compact` lines.
+
+A Codex `context_length_exceeded` error is translated to `invalid_request_error` with
+`prompt is too long` wording so Claude Code can recognize its context recovery path. Non-streaming
+context failures return HTTP 400 with `x-should-retry: false`; an already-open stream receives an
+error event.
+
+Large text histories, including native Claude Code `/compact` requests, are summarized in bounded
+segments through ordinary `/responses`, with up to four segment requests in parallel and `low`
+reasoning effort. Segment summaries are then merged in order. Each request's serialized
+instructions, input, and tools have a 120,000-byte budget; this is a conservative size bound, not
+an exact tokenizer count. Tool calls, results, instructions, and tool schemas are included in the
+checkpoint source. A checkpoint is a model-generated summary, so it cannot preserve every detail.
+
+Local summary preparation has a four-minute deadline. A native compaction request has one
+four-minute deadline covering preparation and the final response; upstream keepalives do not reset
+it. Failed or incomplete segments abort recovery and cancel outstanding segments. The proxy
+returns an explicit error instead of forwarding the same oversized inference. Oversized image
+histories and native instructions or tools that still exceed the budget require a different
+checkpoint; their contents are not silently dropped. These limits apply to proxy recovery, not
+Claude Code's total UI wait time or retries.
 
 The backend URL is an internal ChatGPT Codex contract also used by OpenCode. It can change without
 the compatibility guarantees of the public OpenAI Platform API.

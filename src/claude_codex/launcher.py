@@ -70,7 +70,7 @@ def _configure_context_identity(env: dict[str, str], model: str) -> str | None:
     if (not explicit or explicit == "claude-opus-5-5") and (
         model == "gpt-6.1" or model.startswith("gpt-6.1-")
     ):
-        env["ANTHROPIC_MODEL"] = "claude-opus-5-5[1m]"
+        env["ANTHROPIC_MODEL"] = "claude-opus-5-5"
         return env["ANTHROPIC_MODEL"]
     return explicit or None
 

@@ -36,12 +36,12 @@ does not change persistent permission settings or force a permission mode.
 | Credentials and Anthropic headers | Local credentials are replaced by ChatGPT OAuth; Anthropic version/beta headers are consumed at ingress | Arbitrary custom headers, local keys, and Anthropic beta semantics are not copied into Responses |
 | System attribution | Launcher pins `CLAUDE_CODE_ATTRIBUTION_HEADER=0` before reshaping system blocks | Direct clients should set the same variable; the proxy does not strip prompt text |
 | Streaming | Text/tool deltas stream as Anthropic SSE, with body-gap pings and final message events | Missing terminal events and malformed SSE are errors, never synthetic success |
-| HTTP errors and control headers | Status, complete error message/details, `x-should-retry`, and open `anthropic-ratelimit-unified-*` family are retained; retry dates become integer seconds | Codex errors need an Anthropic envelope; cookies/hop-by-hop headers are excluded; Anthropic plan limits are never fabricated |
+| HTTP errors and control headers | Status, complete error message/details (context overflow gets Claude recovery wording), `x-should-retry`, and open `anthropic-ratelimit-unified-*` family are retained; retry dates become integer seconds | Codex errors need an Anthropic envelope; cookies/hop-by-hop headers are excluded; Anthropic plan limits are never fabricated |
 | Function tools | Names, call IDs, arguments, tool choice, parallel-call policy, and `strict` are translated | Provider tools are rejected; advisor errors retain `Input tag` wording for Claude Code recovery |
 | Tool search | Launcher pins `ENABLE_TOOL_SEARCH=false`; ordinary MCP function tools remain available | `defer_loading`, `tool_reference`, and provider tool-search tools return explicit errors |
 | Effort and thinking | Client effort maps to Codex effort, with `max` mapped to `xhigh` | Explicit `CLAUDE_CODEX_REASONING` wins; default is `xhigh`; Anthropic thinking budgets/signatures are not forwarded or fabricated |
 | Structured outputs | JSON-schema `output_config.format` maps to Responses `text.format`, with strict validation requested | Other formats and Anthropic task budgets are unsupported |
-| Context management | Proxy compaction remains available, excluding auxiliary/classifier and native compaction requests; Anthropic `context_management` returns HTTP 400 | Launcher suppresses experimental beta fields; internal text summaries do not inherit user JSON-output schemas |
+| Context management | Proxy compaction checks previous usage and current input/instructions/tool estimates at 180k by default; auxiliary/classifier requests are excluded; large native compaction histories use bounded segment summaries; Anthropic `context_management` returns HTTP 400 | Native recovery has a four-minute total deadline and aborts on failed/incomplete segments; oversized image histories and remaining native instructions/tools return explicit errors; checkpoint summaries are lossy and do not inherit user JSON-output schemas |
 | Prompt caching | Stable identities and prefix text feed Codex caching; reported usage maps back to Anthropic usage | Anthropic cache markers/TTLs have no Codex equivalent; cache creation is never invented |
 | Model discovery | `/v1/models?limit=1000` directly reports one configured backend with a compatible alias | Discovery remains client opt-in; selection does not change `CLAUDE_CODEX_MODEL` |
 
@@ -55,7 +55,7 @@ tool contracts are rejected before inference.
 Tests exercise launcher invocation and the HTTP APIs. Regression coverage includes settings
 privacy/cleanup, native header precedence, agent isolation, future hint/limit headers, HTTP error
 preservation in JSON and streaming modes, retry dates, structured outputs, effort overrides,
-capability rejection, body-gap pings, malformed/truncated streams, and existing compaction/cache
-behavior. Controlled upstream transports establish local protocol behavior, not no-charge
-classifier eligibility, model availability, subscription context limits, or Anthropic safety review
+capability rejection, body-gap pings, malformed/truncated streams, bounded native history recovery,
+compaction deadlines/cancellation, and existing compaction/cache behavior. Controlled upstream
+transports establish local protocol behavior, not no-charge classifier eligibility, model availability, subscription context limits, or Anthropic safety review
 on Codex.

@@ -32,13 +32,13 @@ class FakeAuth:
 
 
 @pytest.mark.parametrize("value", [None, "invalid"])
-def test_compact_at_tokens_defaults_to_900k(monkeypatch, value) -> None:
+def test_compact_at_tokens_defaults_to_180k(monkeypatch, value) -> None:
     if value is None:
         monkeypatch.delenv("CLAUDE_CODEX_COMPACT_AT", raising=False)
     else:
         monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", value)
 
-    assert _compact_at_tokens() == 900_000
+    assert _compact_at_tokens() == 180_000
 
 
 @pytest.mark.parametrize("value, expected", [("0", 0), ("-1", 0), ("123456", 123_456)])
@@ -300,7 +300,7 @@ async def test_proxy_reuses_complete_codex_cache_identity_for_claude_session() -
 
 
 async def test_proxy_compacts_context_and_reuses_replacement_history(monkeypatch, capsys) -> None:
-    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "100")
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "200")
     monkeypatch.setenv("CLAUDE_CODEX_REMOTE_COMPACT", "1")
     normal_inputs: list[list[dict[str, object]]] = []
     compact_inputs: list[dict[str, object]] = []
@@ -321,7 +321,7 @@ async def test_proxy_compacts_context_and_reuses_replacement_history(monkeypatch
         input_items = body["input"]
         normal_inputs.append(input_items)
         normal_windows.append(request.headers["x-codex-window-id"])
-        input_tokens = 100 if len(normal_inputs) == 1 else 10
+        input_tokens = 200 if len(normal_inputs) == 1 else 10
         event = {
             "type": "response.completed",
             "response": {"usage": {"input_tokens": input_tokens, "output_tokens": 1}},
@@ -372,7 +372,7 @@ async def test_proxy_compacts_context_and_reuses_replacement_history(monkeypatch
     assert normal_windows[1] == normal_windows[2]
     log = capsys.readouterr().out
     assert "codex_compact" in log
-    assert "result=started input_tokens=100 threshold=100" in log
+    assert "result=started input_tokens=200 threshold=200" in log
     assert "result=success implementation=remote" in log
     assert "replacement_items=1" in log
     await upstream_client.aclose()
@@ -464,7 +464,7 @@ async def test_proxy_falls_back_to_local_compact_after_remote_disconnect(monkeyp
 
 
 async def test_proxy_isolates_compaction_branches_within_launcher_session(monkeypatch, capsys) -> None:
-    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "100")
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "200")
     monkeypatch.setenv("CLAUDE_CODEX_REMOTE_COMPACT", "1")
     normal_inputs: list[list[dict[str, object]]] = []
     normal_threads: list[str] = []
@@ -487,7 +487,7 @@ async def test_proxy_isolates_compaction_branches_within_launcher_session(monkey
             if len(input_items) == 1 and input_items and isinstance(input_items[0].get("content"), list)
             else None
         )
-        input_tokens = 100 if initial_user_text in {"a", "b"} else 10
+        input_tokens = 200 if initial_user_text in {"a", "b"} else 10
         event = {
             "type": "response.completed",
             "response": {"usage": {"input_tokens": input_tokens, "output_tokens": 1}},
@@ -903,7 +903,7 @@ async def test_proxy_preserves_backend_rejection_and_retry_headers(stream, statu
             response = await client.post("/v1/messages", json={"messages": [], "stream": stream})
 
     assert response.status_code == status
-    assert response.json()["error"]["message"] == message
+    assert response.json()["error"]["message"] == f"prompt is too long: {message}"
     assert response.json()["error"]["code"] == "context_length_exceeded"
     assert response.headers["retry-after"] == "42"
     assert response.headers["x-should-retry"] == "false"
@@ -1139,3 +1139,378 @@ async def test_auxiliary_classifier_does_not_reuse_main_compaction_state(monkeyp
     assert captured[0][1]["prompt_cache_key"] != captured[1][1]["prompt_cache_key"]
     assert captured[0][1]["input"] == captured[1][1]["input"]
     assert captured[1][1]["input"] == captured[2][1]["input"]
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("event_type", ["response.failed", "error", "flat_error"])
+async def test_context_overflow_sse_is_a_nonretryable_invalid_request(stream, event_type) -> None:
+    message = "Your input exceeds the context window of this model. Please adjust your input and try again."
+    error = {"code": "context_length_exceeded", "message": message, "param": "input"}
+
+    def upstream(_: httpx.Request) -> httpx.Response:
+        event = {"type": "response.failed" if event_type == "response.failed" else "error"}
+        if event_type == "response.failed":
+            event["response"] = {"error": error}
+        elif event_type == "flat_error":
+            event.update(error)
+        else:
+            event["error"] = error
+        return httpx.Response(
+            200, text=f"event: {event['type']}\ndata: {json.dumps(event)}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        app = create_app(auth=FakeAuth(), client=upstream_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post("/v1/messages", json={"messages": [], "stream": stream})
+    if stream:
+        assert response.status_code == 200
+        data = next(json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: "))
+        assert "event: message_stop" not in response.text
+    else:
+        assert response.status_code == 400
+        assert response.headers["x-should-retry"] == "false"
+        data = response.json()
+    assert data["error"]["type"] == "invalid_request_error"
+    assert data["error"]["message"].lower().startswith("prompt is too long")
+    assert message in data["error"]["message"]
+    assert data["error"]["code"] == "context_length_exceeded"
+    assert data["error"]["param"] == "input"
+
+
+@pytest.mark.parametrize("restored", [False, True])
+@pytest.mark.parametrize("large_field", ["messages", "system", "tools"])
+async def test_compaction_checks_current_request_without_prior_large_usage(
+    monkeypatch, restored, large_field
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "100")
+    monkeypatch.delenv("CLAUDE_CODEX_REMOTE_COMPACT", raising=False)
+    summaries = []
+    inputs = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        items = body["input"]
+        last = items[-1]
+        is_summary = last.get("role") == "user" and last["content"][0]["text"].startswith(
+            "You are performing a context checkpoint"
+        )
+        if is_summary:
+            summaries.append(body)
+            delta = {"type": "response.output_text.delta", "delta": "handoff"}
+            prefix = f"event: response.output_text.delta\ndata: {json.dumps(delta)}\n\n"
+        else:
+            inputs.append(items)
+            prefix = ""
+        event = {"type": "response.completed", "response": {"usage": {"input_tokens": 50}}}
+        return httpx.Response(
+            200, text=prefix + f"event: response.completed\ndata: {json.dumps(event)}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    messages = [{"role": "user", "content": "first"}]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        app = create_app(auth=FakeAuth(), client=upstream_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+        ) as client:
+            if not restored:
+                response = await client.post("/v1/messages", json={"messages": messages})
+                assert response.status_code == 200
+                messages.append({"role": "assistant", "content": "answer"})
+            body = {"messages": messages}
+            if large_field == "messages":
+                messages.append({"role": "user", "content": "x" * 800})
+            elif large_field == "system":
+                body["system"] = "x" * 800
+            else:
+                body["tools"] = [
+                    {"name": "lookup", "description": "x" * 800, "input_schema": {"type": "object"}}
+                ]
+            response = await client.post("/v1/messages", json=body)
+            assert response.status_code == 200
+    assert len(summaries) == 1
+    assert "x" * 800 in json.dumps(summaries[0])
+    assert inputs[-1][-1]["content"][0]["text"] == "Context checkpoint summary:\nhandoff"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_native_compaction_recovers_history_larger_than_backend_budget(monkeypatch, stream):
+    monkeypatch.setattr("claude_codex.proxy.COMPACTION_CHUNK_TOKENS", 512, raising=False)
+    leaves = []
+    normal = []
+
+    async def upstream(request):
+        body = json.loads(request.content)
+        size = sum(
+            len(json.dumps(body.get(key, ""), ensure_ascii=False)) for key in ("instructions", "input")
+        )
+        if size > 2048:
+            return httpx.Response(
+                400, json={"error": {"code": "context_length_exceeded", "message": "too big"}}
+            )
+        first_text = body["input"][0]["content"][0]["text"] if body["input"] else ""
+        if first_text.startswith("Transcript segment "):
+            leaves.append(first_text.partition("\n")[2])
+        elif first_text.startswith("Checkpoint summaries"):
+            pass
+        else:
+            normal.append(body)
+        events = [
+            {"type": "response.output_text.delta", "delta": "checkpoint"},
+            {"type": "response.completed", "response": {"usage": {"input_tokens": 100}}},
+        ]
+        return httpx.Response(
+            200,
+            text="".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events),
+        )
+
+    messages = [
+        {"role": "user", "content": "important-user-rule:" + "a" * 2800},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {"query": "source-evidence"}}
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call-1", "content": "actual-result:" + "b" * 2800}
+        ]},
+        {"role": "user", "content": "Write a checkpoint preserving all user requirements."},
+    ]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as backend:
+        app = create_app(auth=FakeAuth(), client=backend)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post(
+                "/v1/messages",
+                headers={
+                    "x-claude-code-session-id": "native-restore", "x-claude-code-request-class": "compaction",
+                },
+                json={"system": "native checkpoint instructions", "messages": messages, "stream": stream},
+            )
+    assert response.status_code == 200
+    assert "event: error" not in response.text
+    assert len(leaves) > 1
+    transcript = json.loads("".join(leaves))
+    assert transcript["instructions"] == "native checkpoint instructions"
+    assert transcript["input"][0]["content"][0]["text"] == messages[0]["content"]
+    assert transcript["input"][1]["call_id"] == "call-1"
+    assert transcript["input"][2]["output"] == messages[2]["content"][0]["content"]
+    assert normal[-1]["instructions"] == "native checkpoint instructions"
+    assert normal[-1]["input"][-1]["content"][0]["text"] == messages[-1]["content"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("phase", ["headers", "body"])
+async def test_native_compaction_has_total_deadline(monkeypatch, stream, phase):
+    monkeypatch.setattr("claude_codex.proxy.COMPACTION_TIMEOUT_SECONDS", 0.03, raising=False)
+    closed = []
+
+    class EndlessBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            try:
+                while True:
+                    await asyncio.sleep(0.005)
+                    yield b": keepalive\n\n"
+            finally:
+                closed.append(True)
+
+    async def upstream(request):
+        if phase == "headers":
+            try:
+                await asyncio.sleep(10)
+            finally:
+                closed.append(True)
+        return httpx.Response(200, stream=EndlessBody())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as backend:
+        app = create_app(auth=FakeAuth(), client=backend)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy.test"
+        ) as client:
+            response = await asyncio.wait_for(client.post(
+                "/v1/messages", headers={"x-claude-code-request-class": "compaction"},
+                json={"messages": [], "stream": stream},
+            ), timeout=0.2)
+    assert closed
+    if stream and phase == "body":
+        assert "compaction_timeout" in response.text
+        assert "event: message_stop" not in response.text
+    else:
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "compaction_timeout"
+        assert response.headers["x-should-retry"] == "false"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("failure", ["response.failed", "response.incomplete"])
+async def test_failed_checkpoint_cancels_siblings_without_sending_normal_inference(
+    monkeypatch, stream, failure
+):
+    monkeypatch.setattr("claude_codex.proxy.COMPACTION_CHUNK_TOKENS", 512)
+    started = asyncio.Event()
+    cancelled = []
+    requests = []
+
+    async def upstream(request):
+        body = json.loads(request.content)
+        text = body["input"][0]["content"][0]["text"]
+        requests.append(text)
+        assert text.startswith("Transcript segment ")
+        if text.startswith("Transcript segment 1\n"):
+            await started.wait()
+            if failure == "response.failed":
+                response = {"error": {
+                    "code": "context_length_exceeded",
+                    "message": "Your input exceeds the context window",
+                }}
+            else:
+                response = {"incomplete_details": {"reason": "max_output_tokens"}}
+            events = [
+                {"type": "response.output_text.delta", "delta": "partial"},
+                {"type": failure, "response": response},
+            ]
+            return httpx.Response(
+                200, text="".join(
+                    f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+                ),
+            )
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        finally:
+            cancelled.append(True)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as backend:
+        app = create_app(auth=FakeAuth(), client=backend)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy.test"
+        ) as client:
+            response = await asyncio.wait_for(client.post(
+                "/v1/messages", headers={"x-claude-code-request-class": "compaction"},
+                json={"messages": [{"role": "user", "content": "x" * 8000}], "stream": stream},
+            ), timeout=0.5)
+    expected = "context_length_exceeded" if failure == "response.failed" else "compaction_incomplete"
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == expected
+    assert response.headers["x-should-retry"] == "false"
+    assert len(requests) > 1
+    assert cancelled
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_oversized_image_checkpoint_fails_explicitly_before_inference(monkeypatch, stream):
+    monkeypatch.setattr("claude_codex.proxy.COMPACTION_CHUNK_TOKENS", 512)
+    requests = []
+
+    async def upstream(request):
+        requests.append(request)
+        raise AssertionError("Image data must not be silently converted into a textual checkpoint")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as backend:
+        app = create_app(auth=FakeAuth(), client=backend)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post(
+                "/v1/messages", headers={"x-claude-code-request-class": "compaction"},
+                json={"stream": stream, "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "x" * 8000},
+                    {"type": "image", "source": {
+                        "type": "url", "url": "https://example.invalid/image.png",
+                    }},
+                ]}]},
+            )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "compaction_images"
+    assert not requests
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_native_checkpoint_refuses_oversized_remaining_instructions(monkeypatch, stream):
+    monkeypatch.setattr("claude_codex.proxy.COMPACTION_CHUNK_TOKENS", 512)
+    normal_requests = []
+
+    async def upstream(request):
+        body = json.loads(request.content)
+        text = body["input"][0]["content"][0]["text"]
+        if not text.startswith(("Transcript segment ", "Checkpoint summaries")):
+            normal_requests.append(body)
+        events = [
+            {"type": "response.output_text.delta", "delta": "checkpoint"},
+            {"type": "response.completed", "response": {}},
+        ]
+        return httpx.Response(
+            200, text="".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+            ),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as backend:
+        app = create_app(auth=FakeAuth(), client=backend)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post(
+                "/v1/messages", headers={"x-claude-code-request-class": "compaction"},
+                json={"stream": stream, "system": "s" * 6000, "messages": [
+                    {"role": "user", "content": "Summarize the history"},
+                ]},
+            )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "compaction_budget"
+    assert not normal_requests
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("content", [
+    pytest.param("x" * 1800, id="ascii"), pytest.param("я" * 900, id="unicode"),
+])
+async def test_local_checkpoint_budget_includes_added_prompt(monkeypatch, stream, content):
+    monkeypatch.setattr("claude_codex.proxy.COMPACTION_CHUNK_TOKENS", 512)
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "1")
+    monkeypatch.delenv("CLAUDE_CODEX_REMOTE_COMPACT", raising=False)
+    leaves = []
+    normal = []
+    oversized = []
+
+    async def upstream(request):
+        body = json.loads(request.content)
+        size = sum(
+            len(json.dumps(body.get(key, ""), ensure_ascii=False).encode())
+            for key in ("instructions", "input", "tools")
+        )
+        if size > 2048:
+            oversized.append(size)
+            return httpx.Response(
+                400, json={"error": {"code": "context_length_exceeded", "message": "too big"}}
+            )
+        text = body["input"][0]["content"][0]["text"]
+        if text.startswith("Transcript segment "):
+            leaves.append(text)
+        elif not text.startswith("Checkpoint summaries"):
+            normal.append(body)
+        events = [
+            {"type": "response.output_text.delta", "delta": "checkpoint"},
+            {"type": "response.completed", "response": {"usage": {"input_tokens": 100}}},
+        ]
+        return httpx.Response(
+            200, text="".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+            ),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as backend:
+        app = create_app(auth=FakeAuth(), client=backend)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post(
+                "/v1/messages", json={
+                    "system": "small", "messages": [{"role": "user", "content": content}], "stream": stream,
+                },
+            )
+    assert response.status_code == 200
+    assert not oversized
+    assert leaves
+    assert normal[-1]["input"][-1]["content"][0]["text"] == "Context checkpoint summary:\ncheckpoint"

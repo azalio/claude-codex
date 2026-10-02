@@ -51,12 +51,12 @@ class Response:
 
 @pytest.mark.parametrize("inherited", [None, "", "claude-opus-5-5"])
 @pytest.mark.parametrize("model", ["gpt-6.1", "gpt-6.1-sol"])
-def test_gpt_6_1_uses_1m_claude_context_identity(inherited: str | None, model: str) -> None:
+def test_gpt_6_1_uses_standard_claude_context_identity(inherited: str | None, model: str) -> None:
     env = {} if inherited is None else {"ANTHROPIC_MODEL": inherited}
 
     result = launcher._configure_context_identity(env, model)
 
-    assert result == "claude-opus-5-5[1m]"
+    assert result == "claude-opus-5-5"
     assert env["ANTHROPIC_MODEL"] == result
 
 

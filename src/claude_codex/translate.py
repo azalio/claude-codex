@@ -11,6 +11,25 @@ Follow the supplied system instructions and use the supplied tools when appropri
 Do not invent tool results. Continue until the user's request is genuinely handled."""
 
 
+class CodexResponseError(RuntimeError):
+    """Сохраняет детали SSE-ошибки и обозначает переполнение для Claude recovery."""
+
+    def __init__(self, error: Any) -> None:
+        self.error = dict(error) if isinstance(error, dict) else {}
+        message = str(self.error.get("message") or "Codex request failed")
+        overflow = self.error.get("code") == "context_length_exceeded" or message.startswith(
+            "Your input exceeds the context window"
+        )
+        self.status_code = 400 if overflow else 502
+        if overflow and not message.lower().startswith("prompt is too long"):
+            message = f"prompt is too long: {message}"
+        self.error.update(type="invalid_request_error" if overflow else "api_error", message=message)
+        super().__init__(message)
+
+    def error_body(self) -> dict[str, Any]:
+        return {"type": "error", "error": self.error.copy()}
+
+
 def _text(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -305,6 +324,7 @@ class AnthropicStream:
     completed: bool = False
     failed: bool = False
     failure_message: str | None = None
+    failure: CodexResponseError | None = None
     stop_reason: str | None = None
     has_tool: bool = False
     blocks: list[Block] = field(default_factory=list)
@@ -393,23 +413,18 @@ class AnthropicStream:
             output.extend(self._start())
             return output
         if event in {"error", "response.failed"}:
-            error = data.get("error") or (data.get("response") or {}).get("error") or {}
+            response = data.get("response")
+            error = data.get("error") or (
+                response.get("error") if isinstance(response, dict) else None
+            )
+            # Responses error event может содержать code/message прямо на верхнем уровне.
+            if not error and event == "error":
+                error = data
             self.failed = True
             self.completed = True
-            self.failure_message = (
-                str(error.get("message") or "Codex request failed")
-                if isinstance(error, dict)
-                else "Codex request failed"
-            )
-            return [
-                (
-                    "error",
-                    {
-                        "type": "error",
-                        "error": {"type": "api_error", "message": self.failure_message},
-                    },
-                )
-            ]
+            self.failure = CodexResponseError(error)
+            self.failure_message = str(self.failure)
+            return [("error", self.failure.error_body())]
         if self.completed:
             return []
         output.extend(self._start())
@@ -528,7 +543,7 @@ class AnthropicStream:
 
     def response(self) -> dict[str, Any]:
         if self.failed:
-            raise RuntimeError(self.failure_message or "Codex request failed")
+            raise self.failure or RuntimeError(self.failure_message or "Codex request failed")
         content: list[dict[str, Any]] = []
         for block in self.blocks:
             if block.kind == "text":

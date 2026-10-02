@@ -1428,17 +1428,31 @@ async def test_oversized_image_checkpoint_fails_explicitly_before_inference(monk
 
 
 @pytest.mark.parametrize("stream", [False, True])
-async def test_native_checkpoint_refuses_oversized_remaining_instructions(monkeypatch, stream):
+@pytest.mark.parametrize("large_field", ["instructions", "tools"])
+async def test_native_checkpoint_recovers_oversized_execution_context(monkeypatch, stream, large_field):
     monkeypatch.setattr("claude_codex.proxy.COMPACTION_CHUNK_TOKENS", 512)
+    leaves = []
     normal_requests = []
+    oversized = []
 
     async def upstream(request):
         body = json.loads(request.content)
+        size = sum(
+            len(json.dumps(body.get(key, ""), ensure_ascii=False).encode())
+            for key in ("instructions", "input", "tools")
+        )
+        if size > 2048:
+            oversized.append(size)
+            return httpx.Response(
+                400, json={"error": {"code": "context_length_exceeded", "message": "too big"}}
+            )
         text = body["input"][0]["content"][0]["text"]
-        if not text.startswith(("Transcript segment ", "Checkpoint summaries")):
+        if text.startswith("Transcript segment "):
+            leaves.append(text.partition("\n")[2])
+        elif not text.startswith("Checkpoint summaries"):
             normal_requests.append(body)
         events = [
-            {"type": "response.output_text.delta", "delta": "checkpoint"},
+            {"type": "response.output_text.delta", "delta": "checkpoint: CRITICAL_POLICY is preserved"},
             {"type": "response.completed", "response": {}},
         ]
         return httpx.Response(
@@ -1447,20 +1461,43 @@ async def test_native_checkpoint_refuses_oversized_remaining_instructions(monkey
             ),
         )
 
+    instruction = "Return a handoff in <summary> tags, preserving all requirements."
+    body = {"stream": stream, "system": "native checkpoint instructions", "messages": [
+        {"role": "user", "content": instruction},
+    ]}
+    if large_field == "instructions":
+        body["system"] = "CRITICAL_POLICY: do not publish. " + "s" * 6000
+    else:
+        body["tools"] = [{
+            "name": "lookup", "description": "CRITICAL_POLICY: do not publish. " + "t" * 6000,
+            "input_schema": {"type": "object"},
+        }]
     async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as backend:
         app = create_app(auth=FakeAuth(), client=backend)
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy.test"
         ) as client:
             response = await client.post(
-                "/v1/messages", headers={"x-claude-code-request-class": "compaction"},
-                json={"stream": stream, "system": "s" * 6000, "messages": [
-                    {"role": "user", "content": "Summarize the history"},
-                ]},
+                "/v1/messages", headers={"x-claude-code-request-class": "compaction"}, json=body,
             )
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "compaction_budget"
-    assert not normal_requests
+    assert response.status_code == 200
+    assert "event: error" not in response.text
+    assert not oversized
+    assert len(leaves) > 1
+    transcript = json.loads("".join(leaves))
+    assert transcript["instructions"] == body["system"]
+    if large_field == "tools":
+        assert transcript["tools"][0]["description"] == body["tools"][0]["description"]
+        assert normal_requests[-1]["instructions"] == body["system"]
+    else:
+        assert len(normal_requests[-1]["instructions"]) < len(body["system"])
+    assert not normal_requests[-1].get("tools")
+    assert normal_requests[-1]["tool_choice"] == "none"
+    assert normal_requests[-1]["parallel_tool_calls"] is False
+    assert normal_requests[-1]["reasoning"]["effort"] == "low"
+    assert "CRITICAL_POLICY" in normal_requests[-1]["input"][0]["content"][0]["text"]
+    assert normal_requests[-1]["input"][-1]["content"][0]["text"] == instruction
+
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("content", [

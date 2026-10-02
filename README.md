@@ -129,14 +129,18 @@ segments through ordinary `/responses`, with up to four segment requests in para
 reasoning effort. Segment summaries are then merged in order. Each request's serialized
 instructions, input, and tools have a 120,000-byte budget; this is a conservative size bound, not
 an exact tokenizer count. Tool calls, results, instructions, and tool schemas are included in the
-checkpoint source. A checkpoint is a model-generated summary, so it cannot preserve every detail.
+checkpoint source. The final native compaction request disables tool execution and omits tool
+schemas already covered by the checkpoint. If its original system text still exceeds the budget,
+it uses a compact-only instruction and preserves the last bounded user formatting request.
+Ordinary agent requests keep their system instructions and function tools. A checkpoint is a
+model-generated summary, so it cannot preserve every detail.
 
 Local summary preparation has a four-minute deadline. A native compaction request has one
 four-minute deadline covering preparation and the final response; upstream keepalives do not reset
 it. Failed or incomplete segments abort recovery and cancel outstanding segments. The proxy
 returns an explicit error instead of forwarding the same oversized inference. Oversized image
-histories and native instructions or tools that still exceed the budget require a different
-checkpoint; their contents are not silently dropped. These limits apply to proxy recovery, not
+histories and checkpoint summaries or retained format instructions that still exceed the budget
+require a different checkpoint; their contents are not silently dropped. These limits apply to proxy recovery, not
 Claude Code's total UI wait time or retries.
 
 The backend URL is an internal ChatGPT Codex contract also used by OpenCode. It can change without

@@ -135,6 +135,28 @@ URL queries are excluded. Restart existing launcher processes to enable new logg
 tail -f ~/.local/state/claude-codex/proxy.log | rg 'proxy_upstream'
 ```
 
+
+Compare classifier models without executing the command under evaluation:
+
+```bash
+.venv/bin/python -m claude_codex.benchmark \
+  --command 'sl-review sourcecraft list-comments yc/quantum/pr/4427 --json --insecure'
+```
+
+The test captures the installed Claude Code's full classifier policy using a harmless
+synthetic tool proposal. The evaluated command is substituted only into the captured
+request; its verdict is never sent to a tool executor. Five cloud models are tested
+by default, three times each, at low effort with concurrency two. Use repeated
+`--model NAME` arguments to select other models, `--repeats` to change the number
+of trials, or `--base-url` to select another Ollama server. Cloud requests use the
+Ollama account's quota. Model aliases are pulled before testing; local models may
+download weights. JSON results and a Markdown summary are saved privately under
+`~/.local/state/claude-codex/benchmarks/classifier-comparison/`.
+This synthetic test does not replay your session history or trust settings.
+The [measured comparison](docs/research/classifier-model-comparison-2026-10-03.md)
+contains results for the command above.
+
+
 Configuration:
 
 ```bash

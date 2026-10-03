@@ -248,11 +248,25 @@ def test_proxy_settings_preserve_arguments_after_separator() -> None:
 
 
 @pytest.mark.parametrize(
-    "configured, expected_reasoning", [(None, "medium"), ("", "medium"), ("xhigh", "xhigh")]
+    "configured, expected_reasoning, auxiliary_model, auxiliary_reasoning, expected_auxiliary",
+    [
+        (None, "medium", None, None, ("gpt-6-luna", "low")),
+        ("", "medium", "", "", ("gpt-6-luna", "low")),
+        ("xhigh", "xhigh", None, None, ("gpt-6-luna", "low")),
+        (None, "medium", None, "high", ("gpt-6-luna", "high")),
+        ("xhigh", "xhigh", "gpt-6-sol", "medium", ("gpt-6-sol", "medium")),
+    ],
 )
 @pytest.mark.parametrize("outcome", ["exit", "error", "interrupt"])
 def test_launcher_keeps_settings_private_and_cleans_up(
-    monkeypatch, tmp_path, outcome, configured, expected_reasoning
+    monkeypatch,
+    tmp_path,
+    outcome,
+    configured,
+    expected_reasoning,
+    auxiliary_model,
+    auxiliary_reasoning,
+    expected_auxiliary,
 ) -> None:
     import io
 
@@ -269,8 +283,23 @@ def test_launcher_keeps_settings_private_and_cleans_up(
     else:
         monkeypatch.setenv("CLAUDE_CODEX_REASONING", configured)
 
+    for key, value in (
+        ("CLAUDE_CODEX_AUXILIARY_MODEL", auxiliary_model),
+        ("CLAUDE_CODEX_AUXILIARY_REASONING", auxiliary_reasoning),
+    ):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+
+    def assert_auxiliary(env):
+        assert (
+            env["CLAUDE_CODEX_AUXILIARY_MODEL"], env["CLAUDE_CODEX_AUXILIARY_REASONING"]
+        ) == expected_auxiliary
+
     def start_proxy(*args, **kwargs):
         assert kwargs["env"]["CLAUDE_CODEX_REASONING"] == expected_reasoning
+        assert_auxiliary(kwargs["env"])
         return proxy
 
     monkeypatch.setattr(launcher.subprocess, "Popen", start_proxy)
@@ -297,6 +326,7 @@ def test_launcher_keeps_settings_private_and_cleans_up(
 
     def run(command, *, env):
         assert env["CLAUDE_CODEX_REASONING"] == expected_reasoning
+        assert_auxiliary(env)
         assert command[0:2] == ["/bin/claude", "--settings"]
         assert command[-2:] == ["-p", "hello"]
         assert not any(secret in arg or header_secret in arg for arg in command)
@@ -306,6 +336,7 @@ def test_launcher_keeps_settings_private_and_cleans_up(
         assert private.stat().st_mode & 0o777 == 0o600
         merged = json.loads(private.read_text())
         pinned = merged["env"]
+        assert_auxiliary(pinned)
         assert pinned["MCP_SERVICE_TOKEN"] == secret
         assert merged["hooks"] == settings["hooks"]
         assert merged["permissions"] == settings["permissions"]

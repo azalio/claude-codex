@@ -24,13 +24,15 @@ never invents a safety verdict or silently removes a requested safety check. The
 is temporary upstream API and may require adjustment in future Claude Code releases. The launcher
 does not change persistent permission settings or force a permission mode.
 
-Optional `CLAUDE_CODEX_AUXILIARY_MODEL` and `CLAUDE_CODEX_AUXILIARY_REASONING`
-select a separate backend and effort for `x-claude-code-request-class: auxiliary`.
-An auxiliary model override defaults to `low` effort. Without either override, the
-main model and reasoning remain effective. This class also includes titles and auxiliary
+The launcher defaults `CLAUDE_CODEX_AUXILIARY_MODEL` to `gpt-6-luna` and
+`CLAUDE_CODEX_AUXILIARY_REASONING` to `low`. Nonempty explicit values override
+each default. These select a separate backend and effort for
+`x-claude-code-request-class: auxiliary`. This class also includes titles and auxiliary
 summaries, so it is broader than auto-mode checks. Requests without hints stay on the
-main route. Classifier compatibility and safety must be evaluated with the selected model;
-routing alone does not fix Stage 2 errors or change permission policy.
+main route. A standalone proxy without these variables retains the main model and
+reasoning; setting an auxiliary model alone selects low effort. Classifier compatibility
+and safety must be evaluated with the selected model; routing alone does not fix Stage 2
+errors or change permission policy.
 
 ## Compatibility matrix
 

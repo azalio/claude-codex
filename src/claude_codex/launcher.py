@@ -165,6 +165,12 @@ def main() -> None:
     proxy_env = os.environ.copy()
     # Claude Code may send its own implicit max effort; pin the gateway default.
     proxy_env["CLAUDE_CODEX_REASONING"] = proxy_env.get("CLAUDE_CODEX_REASONING") or "medium"
+    proxy_env["CLAUDE_CODEX_AUXILIARY_MODEL"] = (
+        proxy_env.get("CLAUDE_CODEX_AUXILIARY_MODEL") or "gpt-6-luna"
+    )
+    proxy_env["CLAUDE_CODEX_AUXILIARY_REASONING"] = (
+        proxy_env.get("CLAUDE_CODEX_AUXILIARY_REASONING") or "low"
+    )
     try:
         proxy = subprocess.Popen(
             [
@@ -201,6 +207,8 @@ def main() -> None:
         env = proxy_env.copy()
         overrides = {
             "CLAUDE_CODEX_REASONING": env["CLAUDE_CODEX_REASONING"],
+            "CLAUDE_CODEX_AUXILIARY_MODEL": env["CLAUDE_CODEX_AUXILIARY_MODEL"],
+            "CLAUDE_CODEX_AUXILIARY_REASONING": env["CLAUDE_CODEX_AUXILIARY_REASONING"],
             "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
             "ANTHROPIC_AUTH_TOKEN": "claude-codex-local",
             "ANTHROPIC_API_KEY": "claude-codex-local",

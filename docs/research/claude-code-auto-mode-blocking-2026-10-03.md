@@ -26,13 +26,13 @@ The launcher pins `CLAUDE_CODE_AUTO_MODE_SERVER=0`:
 requests rather than unsupported Anthropic server safeguards.
 
 [The proxy route](../../src/claude_codex/proxy.py#L990) normally uses the configured
-main Codex model and effort for every client model alias. The opt-in auxiliary route
-now provides:
+main Codex model and effort for every client model alias. The auxiliary route provides:
 
 - `CLAUDE_CODEX_AUXILIARY_MODEL`: model for the `auxiliary` request class.
 - `CLAUDE_CODEX_AUXILIARY_REASONING`: its reasoning override.
-- A model override with no auxiliary reasoning override selects `low`.
-- Without either override, the existing main model and effort stay effective.
+- The launcher defaults auxiliary requests to `gpt-6-luna` / `low`.
+- Nonempty explicit overrides take precedence independently.
+- A standalone proxy without either override retains the main model and effort.
 - Main turns, subagents, workflows, and compaction retain their original route.
 
 The [gateway protocol](https://code.claude.com/docs/en/llm-gateway-protocol#gateway-hint-headers)
@@ -54,7 +54,7 @@ faster candidate; it does not establish permission-classifier accuracy or fewer 
 
 Local verification:
 
-- 167 tests pass; Ruff and `git diff --check` pass.
+- 173 tests pass; Ruff and `git diff --check` pass.
 - Actual Claude Code 2.1.284, `--bare`, auto mode, a temporary test directory, and a
   synthetic command that only prints a marker.
 - The actual classifier request reached GPT-6 Luna / low, returned HTTP 200 and
@@ -67,9 +67,14 @@ Local verification:
   remained GPT-6.1 Sol / medium. These are protocol smoke tests, not a representative
   latency benchmark or a safety evaluation.
 
+A follow-up smoke test removed both auxiliary variables from the launcher environment.
+The real classifier used the default GPT-6 Luna / low, completed in 1.808 seconds,
+and Claude Code ran the harmless marker. Main outgoing payloads stayed GPT-6.1 Sol / medium.
+This verifies the launcher default, not a general latency or accuracy claim.
+
 Private metadata artifacts:
 `~/.local/state/claude-codex/benchmarks/20261003-auxiliary-routing/results.json` and
-`stage2-results.json`. No real user commands or conversation payloads were included.
+`stage2-results.json`, plus `default-results.json`. No real user commands or conversation payloads were included.
 There is no evidence yet that this change fixes historical Stage 2 failures.
 
 ## Policy denials need a different remedy
@@ -98,8 +103,8 @@ It is a practical temporary alternative when classifier errors persist.
 ## Using the separate route
 
 ```bash
-CLAUDE_CODEX_AUXILIARY_MODEL=gpt-6-luna claude-codex --continue
+claude-codex --continue
 ```
 
-The selected auxiliary model defaults to low; the main launcher default remains medium.
+The launcher defaults auxiliary requests to GPT-6 Luna / low; main reasoning remains medium.
 See [README](../../README.md) for overrides and scope. Relaunch to apply it to an existing session.

@@ -199,8 +199,10 @@ context failures return HTTP 400 with `x-should-retry: false`; an already-open s
 error event.
 
 Large text histories, including native Claude Code `/compact` requests, are summarized in bounded
-segments through ordinary `/responses`, with up to four segment requests in parallel and `low`
-reasoning effort. Segment summaries are then merged in order. Each request's serialized
+segments through ordinary `/responses`, with up to four segment requests in parallel.
+Internal checkpoint summaries default to `gpt-6-luna` with `low` reasoning. Set
+`CLAUDE_CODEX_COMPACTION_MODEL` to choose another Codex subscription model; this does
+not change normal answers or the auxiliary endpoint. Segment summaries are then merged in order. Each request's serialized
 instructions, input, and tools have a 120,000-byte budget; this is a conservative size bound, not
 an exact tokenizer count. Tool calls, results, instructions, and tool schemas are included in the
 checkpoint source. The final native compaction request disables tool execution and omits tool
@@ -208,6 +210,24 @@ schemas already covered by the checkpoint. If its original system text still exc
 it uses a compact-only instruction and preserves the last bounded user formatting request.
 Ordinary agent requests keep their system instructions and function tools. A checkpoint is a
 model-generated summary, so it cannot preserve every detail.
+
+Completed checkpoint summaries are cached privately under
+`~/.local/state/claude-codex/checkpoints/`. Cache keys bind the backend, session,
+agent, request class, selected checkpoint model, instructions, and exact segment
+content. After a timeout or launcher restart, matching completed segments are reused;
+unfinished or failed segments are retried. Appending a new user message invalidates
+changed segments, not earlier matching ones. Merge summaries are cached too.
+Source transcripts are not stored in this cache; summary files use mode 0600 inside
+mode-0700 directories. Entries older than 24 hours are ignored. Set
+`CLAUDE_CODEX_CHECKPOINT_CACHE=0` to disable cache reads and writes.
+Replacement conversation history still remains in memory.
+
+Progress is logged as `codex_checkpoint`, including segment/total, selected model,
+and started/completed/cached/cancelled/error outcomes, without transcript or summary text.
+
+```bash
+tail -f ~/.local/state/claude-codex/proxy.log | rg 'codex_checkpoint|codex_compact'
+```
 
 Local summary preparation has a four-minute deadline. A native compaction request has one
 four-minute deadline covering preparation and the final response; upstream keepalives do not reset

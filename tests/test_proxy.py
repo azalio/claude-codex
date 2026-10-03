@@ -19,6 +19,7 @@ from claude_codex.proxy import _compact_at_tokens, _remote_compact_enabled, crea
 def isolated_installation_id(monkeypatch, tmp_path: Path) -> Path:
     path = tmp_path / "installation_id"
     monkeypatch.setattr("claude_codex.proxy.INSTALLATION_ID_PATH", path)
+    monkeypatch.setattr("claude_codex.proxy.CHECKPOINT_CACHE_PATH", tmp_path / "checkpoints")
     return path
 
 
@@ -1764,3 +1765,83 @@ async def test_upstream_log_redacts_endpoint_credentials_and_query(monkeypatch, 
             for line in output.splitlines() if line.startswith("proxy_upstream ")]
     assert logs[0]["endpoint_origin"] == "http://localhost:11434"
     assert logs[-1]["http_status"] == 503
+
+async def test_large_checkpoint_resumes_completed_segments_after_restart(monkeypatch, tmp_path):
+    monkeypatch.setattr("claude_codex.proxy.COMPACTION_CHUNK_TOKENS", 512)
+    monkeypatch.setattr("claude_codex.proxy.COMPACTION_CONCURRENCY", 1)
+    monkeypatch.setattr("claude_codex.proxy.COMPACTION_TIMEOUT_SECONDS", 0.04)
+    monkeypatch.setattr("claude_codex.proxy.CHECKPOINT_CACHE_PATH", tmp_path / "checkpoints", raising=False)
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "1")
+    phase = 1
+    seen = [[], []]
+
+    async def upstream(request):
+        body = json.loads(request.content)
+        text = body["input"][0]["content"][0]["text"]
+        if text.startswith("Transcript segment "):
+            index = int(text.splitlines()[0].split()[-1])
+            seen[phase - 1].append(index)
+            if phase == 1 and index > 1:
+                await asyncio.sleep(10)
+            summary = f"summary-{index}"
+        elif text.startswith("Checkpoint summaries"):
+            summary = "restored checkpoint"
+        else:
+            summary = "normal answer"
+        events = [
+            {"type": "response.output_text.delta", "output_index": 0, "delta": summary},
+            {"type": "response.completed", "response": {"usage": {"input_tokens": 10, "output_tokens": 2}}},
+        ]
+        return httpx.Response(200, text="".join("data: " + json.dumps(e) + "\n\n" for e in events))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
+        async def send():
+            app = create_app(auth=FakeAuth(), client=http)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy"
+            ) as c:
+                return await c.post(
+                    "/v1/messages", headers={"x-claude-code-session-id": "resume-checkpoint"},
+                    json={"model": "claude-codex", "messages": [
+                        {"role": "user", "content": "x" * 5000},
+                    ] + ([{"role": "user", "content": "continue"}] if phase == 2 else [])},
+                )
+
+        first = await send()
+        assert first.status_code == 400
+        assert first.json()["error"]["code"] == "compaction_timeout"
+        phase = 2
+        second = await send()
+    assert second.status_code == 200
+    assert seen[0][0] == 1
+    assert seen[1]
+    assert 1 not in seen[1], "Completed segment was lost across proxy restart"
+
+@pytest.mark.parametrize("override, expected", [(None, "gpt-6-luna"), ("gpt-6.1-sol", "gpt-6.1-sol")])
+async def test_checkpoint_model_override_leaves_main_model_unchanged(monkeypatch, override, expected):
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "1")
+    monkeypatch.setenv("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
+    if override is None:
+        monkeypatch.delenv("CLAUDE_CODEX_COMPACTION_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CODEX_COMPACTION_MODEL", override)
+    models = []
+
+    def upstream(request):
+        payload = json.loads(request.content)
+        models.append(payload["model"])
+        events = [
+            {"type": "response.output_text.delta", "output_index": 0, "delta": "checkpoint"},
+            {"type": "response.completed"},
+        ]
+        return httpx.Response(200, text="".join("data: " + json.dumps(e) + "\n\n" for e in events))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
+        app = create_app(auth=FakeAuth(), client=http)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as c:
+            response = await c.post(
+                "/v1/messages",
+                json={"model": "claude-codex", "messages": [{"role": "user", "content": "task"}]},
+            )
+    assert response.status_code == 200
+    assert models == [expected, "gpt-6.1-sol"]

@@ -567,7 +567,8 @@ async def test_nonstream_surfaces_cached_input_usage(capsys, isolated_installati
         "cache_creation_input_tokens": 1024,
         "output_tokens": 2,
     }
-    assert capsys.readouterr().out == (
+    assert "".join(line for line in capsys.readouterr().out.splitlines(keepends=True)
+                   if line.startswith("codex_cache ")) == (
         "codex_cache source=upstream "
         f"client_id={isolated_installation_id.read_text().strip()} "
         "session_source=default session_id=claude-codex result=hit input_tokens=4096 "
@@ -610,7 +611,8 @@ async def test_nonstream_marks_unreported_cache_write_usage(capsys, isolated_ins
         "cache_read_input_tokens": 3072,
         "output_tokens": 2,
     }
-    assert capsys.readouterr().out == (
+    assert "".join(line for line in capsys.readouterr().out.splitlines(keepends=True)
+                   if line.startswith("codex_cache ")) == (
         "codex_cache source=upstream "
         f"client_id={isolated_installation_id.read_text().strip()} "
         "session_source=default session_id=claude-codex result=hit input_tokens=4096 "
@@ -1625,7 +1627,7 @@ async def test_local_checkpoint_budget_includes_added_prompt(monkeypatch, stream
 @pytest.mark.parametrize("request_class", [None, "main", "subagent", "workflow", "compaction", "auxiliary"])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("model", ["deepseek-v4.1-flash:cloud", "my-local-classifier:latest"])
-async def test_auxiliary_endpoint_isolated_from_codex_auth(monkeypatch, request_class, stream, model):
+async def test_auxiliary_endpoint_isolated_from_codex_auth(monkeypatch, request_class, stream, model, capsys):
     monkeypatch.setenv("CLAUDE_CODEX_AUXILIARY_ENDPOINT", "http://localhost:11434/v1/responses")
     monkeypatch.setenv("CLAUDE_CODEX_AUXILIARY_MODEL", model)
     monkeypatch.setenv("CLAUDE_CODEX_REASONING", "medium")
@@ -1666,7 +1668,21 @@ async def test_auxiliary_endpoint_isolated_from_codex_auth(monkeypatch, request_
     assert len(captured) == 1
     req = captured[0]
     payload = json.loads(req.content)
+    logs = [json.loads(line.removeprefix("proxy_upstream "))
+            for line in capsys.readouterr().out.splitlines() if line.startswith("proxy_upstream ")]
+    assert [entry["event"] for entry in logs] == ["start", "end"]
+    assert logs[0]["request_id"] == logs[1]["request_id"]
+    assert logs[0]["request_class"] == (request_class or "main")
+    assert logs[0]["model"] == payload["model"]
+    assert logs[0]["effort"] == payload["reasoning"]["effort"]
+    assert logs[1]["result"] == "completed"
+    assert logs[1]["duration_ms"] >= 0
+    assert "VERDICT" not in json.dumps(logs)
+    assert "Synthetic check." not in json.dumps(logs)
+    assert logs[0]["backend"] == ("auxiliary" if request_class == "auxiliary" else "codex")
     if request_class == "auxiliary":
+        assert logs[0]["endpoint_origin"] == "http://localhost:11434"
+
         assert str(req.url) == "http://localhost:11434/v1/responses"
         assert not auth_calls
         assert "authorization" not in req.headers
@@ -1689,7 +1705,7 @@ async def test_auxiliary_endpoint_isolated_from_codex_auth(monkeypatch, request_
     (200, 'data: not-json\n\n'),
 ])
 @pytest.mark.parametrize("stream", [False, True])
-async def test_auxiliary_endpoint_errors_do_not_fallback_or_allow(monkeypatch, status, text, stream):
+async def test_auxiliary_endpoint_errors_do_not_fallback_or_allow(monkeypatch, status, text, stream, capsys):
     monkeypatch.setenv("CLAUDE_CODEX_AUXILIARY_ENDPOINT", "http://localhost:11434/v1/responses")
     calls = []
 
@@ -1713,3 +1729,38 @@ async def test_auxiliary_endpoint_errors_do_not_fallback_or_allow(monkeypatch, s
         assert r.status_code >= 400
     assert len(calls) == 1
     assert calls[0].url.host == "localhost"
+    logs = [json.loads(line.removeprefix("proxy_upstream "))
+            for line in capsys.readouterr().out.splitlines() if line.startswith("proxy_upstream ")]
+    assert logs[-1]["event"] == "end"
+    assert logs[-1]["result"] == "error"
+    assert "error_type" in logs[-1]
+    if status != 200:
+        assert logs[-1]["http_status"] == status
+    assert "model not found" not in json.dumps(logs)
+
+
+async def test_upstream_log_redacts_endpoint_credentials_and_query(monkeypatch, capsys):
+    monkeypatch.setenv(
+        "CLAUDE_CODEX_AUXILIARY_ENDPOINT",
+        "http://private-user:private-password@localhost:11434/v1/responses?token=private-query",
+    )
+
+    def upstream(request):
+        return httpx.Response(503, text="private-error-body")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
+        app = create_app(auth=FakeAuth(), client=http)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as c:
+            await c.post(
+                "/v1/messages", headers={"x-claude-code-request-class": "auxiliary"},
+                json={"model": "claude-codex", "messages": []},
+            )
+    output = capsys.readouterr().out
+    for secret in (
+        "private-user", "private-password", "private-query", "private-error-body", "Bearer access",
+    ):
+        assert secret not in output
+    logs = [json.loads(line.removeprefix("proxy_upstream "))
+            for line in output.splitlines() if line.startswith("proxy_upstream ")]
+    assert logs[0]["endpoint_origin"] == "http://localhost:11434"
+    assert logs[-1]["http_status"] == 503

@@ -124,6 +124,17 @@ on errors. The `:cloud` model above runs in Ollama's cloud, despite the localhos
 endpoint; use an installed local model for on-device inference. Other request classes
 keep the ChatGPT route. Unset the auxiliary endpoint to return to the Codex backend.
 
+Forwarded requests write structured lines prefixed with `proxy_upstream` to
+`~/.local/state/claude-codex/proxy.log`: request start and backend result,
+model, effort, request class, session/request IDs, endpoint origin, and elapsed time.
+A completed backend response confirms inference, not that Claude Code accepted the
+classifier verdict. Prompts, generated text, OAuth tokens, endpoint credentials, and
+URL queries are excluded. Restart existing launcher processes to enable new logging.
+
+```bash
+tail -f ~/.local/state/claude-codex/proxy.log | rg 'proxy_upstream'
+```
+
 Configuration:
 
 ```bash

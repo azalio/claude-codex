@@ -1084,23 +1084,67 @@ def create_app(
                 if auxiliary_backend is not None and identity.request_class == "auxiliary"
                 else backend
             )
+            url = httpx.URL(selected_backend.endpoint)
+            host = f"[{url.host}]" if ":" in url.host else url.host
+            origin = f"{url.scheme}://{host}" + (f":{url.port}" if url.port else "")
+            metadata = {
+                "request_id": uuid.uuid4().hex,
+                "session_id": identity.session_id,
+                "request_class": identity.request_class,
+                "backend": "auxiliary" if selected_backend is auxiliary_backend else "codex",
+                "model": codex_model,
+                "effort": reasoning,
+                "endpoint_origin": origin,
+            }
+            started = asyncio.get_running_loop().time()
+
+            def log(event: str, **fields: Any) -> None:
+                record = {
+                    "time": datetime.now(UTC).isoformat(), "event": event, **metadata, **fields,
+                }
+                print("proxy_upstream " + json.dumps(record, ensure_ascii=True), flush=True)
+
+            log("start")
+            result = "cancelled"
+            details: dict[str, Any] = {}
             source = selected_backend.events(upstream, identity, request_headers=hints)
             try:
                 while True:
-                    # Timer живёт только во время await: generator читается сначала
-                    # request task, затем pump task, между yield меняется владелец.
+                    # Timer lives only during await: the consumer changes tasks between yields.
                     try:
                         async with asyncio.timeout_at(deadline):
                             event = await anext(source)
                     except StopAsyncIteration:
                         return
+                    name, data = event
+                    if name in {"response.completed", "response.incomplete", "response.failed", "error"}:
+                        result = name.removeprefix("response.")
+                        response = data.get("response")
+                        reported = response.get("model") if isinstance(response, dict) else None
+                        if isinstance(reported, str):
+                            details["reported_model"] = reported
                     yield event
             except TimeoutError as exc:
+                result = "error"
+                details["error_type"] = type(exc).__name__
                 raise _compaction_failure(
                     "compaction_timeout", "Context compaction exceeded its total deadline"
                 ) from exc
+            except Exception as exc:
+                result = "error"
+                details["error_type"] = type(exc).__name__
+                if isinstance(exc, BackendError):
+                    details["http_status"] = exc.status_code
+                raise
             finally:
-                await source.aclose()
+                try:
+                    await source.aclose()
+                finally:
+                    log(
+                        "end", result=result,
+                        duration_ms=round((asyncio.get_running_loop().time() - started) * 1000),
+                        **details,
+                    )
 
         if body.get("stream", False):
             input_tokens = estimate_tokens(body)

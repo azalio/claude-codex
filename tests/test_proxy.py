@@ -1043,6 +1043,64 @@ async def test_output_effort_is_translated_unless_backend_override_is_set(
     assert captured[0]["reasoning"]["effort"] == expected
 
 
+@pytest.mark.parametrize(
+    "request_class, auxiliary_model, auxiliary_effort, expected_model, expected_effort",
+    [
+        (None, "gpt-6-luna", "low", "gpt-6.1-sol", "medium"),
+        ("main", "gpt-6-luna", "low", "gpt-6.1-sol", "medium"),
+        ("subagent", "gpt-6-luna", "low", "gpt-6.1-sol", "medium"),
+        ("workflow", "gpt-6-luna", "low", "gpt-6.1-sol", "medium"),
+        ("compaction", "gpt-6-luna", "low", "gpt-6.1-sol", "medium"),
+        ("auxiliary", None, None, "gpt-6.1-sol", "medium"),
+        ("auxiliary", "", "", "gpt-6.1-sol", "medium"),
+        ("auxiliary", None, "low", "gpt-6.1-sol", "low"),
+        ("auxiliary", "gpt-6-luna", None, "gpt-6-luna", "low"),
+        ("auxiliary", "gpt-6-luna", "", "gpt-6-luna", "low"),
+        ("auxiliary", "gpt-6-luna", "high", "gpt-6-luna", "high"),
+    ],
+)
+async def test_auxiliary_routing_keeps_main_and_other_request_classes_unchanged(
+    monkeypatch, request_class, auxiliary_model, auxiliary_effort, expected_model, expected_effort
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
+    monkeypatch.setenv("CLAUDE_CODEX_REASONING", "medium")
+    for name, value in (
+        ("CLAUDE_CODEX_AUXILIARY_MODEL", auxiliary_model),
+        ("CLAUDE_CODEX_AUXILIARY_REASONING", auxiliary_effort),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    captured = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, text='data: {"type":"response.completed"}\n\n')
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        app = create_app(auth=FakeAuth(), client=upstream_client)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+        ) as client:
+            headers = {"x-claude-code-session-id": "routing-test"}
+            if request_class is not None:
+                headers["x-claude-code-request-class"] = request_class
+            response = await client.post(
+                "/v1/messages",
+                headers=headers,
+                json={
+                    "model": "claude-sonnet-5",
+                    "output_config": {"effort": "max"},
+                    "messages": [{"role": "user", "content": "Synthetic routing check."}],
+                },
+            )
+    assert response.status_code == 200
+    assert len(captured) == 1
+    assert captured[0]["model"] == expected_model
+    assert captured[0]["reasoning"]["effort"] == expected_effort
+
+
 async def test_startup_probe_and_discovery_report_only_the_configured_backend(monkeypatch) -> None:
     monkeypatch.setenv("CLAUDE_CODEX_MODEL", "gpt-test-backend")
     monkeypatch.setenv("ANTHROPIC_MODEL", "anthropic-codex-alias")

@@ -88,6 +88,19 @@ Claude Code's implicit effort does not raise it. Set `CLAUDE_CODEX_REASONING`
 to choose another level; it takes precedence over the client effort. Restart
 `claude-codex` to apply a changed default or override to an existing session.
 
+For a separate model for auto-mode checks, set `CLAUDE_CODEX_AUXILIARY_MODEL`.
+This routes requests carrying `x-claude-code-request-class: auxiliary`, including
+classifiers, session titles, and auxiliary summaries. It does not change the main model,
+subagents, workflows, or compaction. Selecting an auxiliary model defaults its reasoning
+to `low`; `CLAUDE_CODEX_AUXILIARY_REASONING` overrides that level and can also be used
+alone. Without either variable, auxiliary requests retain the main model and reasoning.
+The launcher enables the required gateway hint headers. A lighter model is experimental
+for Claude Code's classifier; it does not guarantee fewer denials or equivalent safety.
+
+```bash
+CLAUDE_CODEX_AUXILIARY_MODEL=gpt-6-luna claude-codex
+```
+
 Configuration:
 
 ```bash

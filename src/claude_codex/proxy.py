@@ -1001,6 +1001,13 @@ def create_app(
             request.headers.get("x-claude-code-agent-id", ""),
             request.headers.get("x-claude-code-request-class") or "main",
         )
+        if session_identity.request_class == "auxiliary":
+            # Служебный класс включает classifier, названия сеансов и сводки.
+            auxiliary_model = os.environ.get("CLAUDE_CODEX_AUXILIARY_MODEL")
+            codex_model = auxiliary_model or codex_model
+            reasoning = os.environ.get("CLAUDE_CODEX_AUXILIARY_REASONING") or (
+                "low" if auxiliary_model else reasoning
+            )
         # Hints имеют открытый набор имён. Credentials и произвольные custom
         # headers клиента не должны попадать в другой backend.
         hints = {name: value for name, value in request.headers.items() if name.startswith("x-claude-code-")}

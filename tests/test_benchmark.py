@@ -5,7 +5,15 @@ import json
 import httpx
 import pytest
 
-from claude_codex.benchmark import MARKER_COMMAND, parse_verdict, rewrite_command, summary, trial
+from claude_codex.benchmark import (
+    MARKER_COMMAND,
+    capture_request,
+    ensure_model,
+    parse_verdict,
+    rewrite_command,
+    summary,
+    trial,
+)
 
 
 @pytest.mark.parametrize("text, decision, severity", [
@@ -83,3 +91,65 @@ def test_summary_separates_failures_from_valid_verdict_latency():
     assert "| example | 0 | 2 | 2 | 60-65 | 4.000 |" in text
     assert "api_error" in text
     assert "never executed" in text
+
+
+@pytest.mark.parametrize("stage", [0, 3])
+async def test_capture_rejects_unknown_classifier_stage(stage):
+    with pytest.raises(ValueError, match="stage"):
+        await capture_request("git status --short", stage=stage)
+
+
+@pytest.mark.parametrize("stage, expected", [(1, "invalid_format"), (2, "block")])
+def test_stage_two_accepts_only_closed_thinking_before_verdict(stage, expected):
+    reply = (
+        "<thinking>Evaluate the requested action.</thinking>\n"
+        "<severity>75</severity><category>Security Weaken</category>"
+    )
+    assert parse_verdict(reply, stage=stage)["decision"] == expected
+    unfinished = "<thinking>unfinished <severity>75</severity>"
+    assert parse_verdict(unfinished, stage=stage)["decision"] == "invalid_format"
+
+
+
+async def test_trial_stage_two_none_preserves_verdict_and_request_settings():
+    def backend(request):
+        body = json.loads(request.content)
+        assert body["reasoning"] == {"effort": "none"}
+        assert body["instructions"] == "native policy"
+        events = [
+            {"type": "response.output_text.delta", "delta":
+             "<thinking>Read-only request.</thinking><severity>0</severity>"},
+            {"type": "response.completed"},
+        ]
+        return httpx.Response(
+            200, text="".join("data: " + json.dumps(e) + "\n\n" for e in events),
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://ollama.test", transport=httpx.MockTransport(backend),
+    ) as client:
+        row = await trial(
+            client, {"instructions": "native policy", "input": []}, "chosen-model", 1, 5,
+            stage=2, effort="none",
+        )
+    assert row["decision"] == "allow"
+
+
+@pytest.mark.parametrize("installed, expected_pull", [(True, False), (False, True)])
+async def test_local_alias_is_not_pulled_from_registry(installed, expected_pull):
+    calls = []
+
+    def backend(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={
+                "models": [{"name": "local-classifier:latest"}] if installed else [],
+            })
+        assert json.loads(request.content)["model"] == "local-classifier"
+        return httpx.Response(200, json={"status": "success"})
+
+    async with httpx.AsyncClient(
+        base_url="http://ollama.test", transport=httpx.MockTransport(backend),
+    ) as client:
+        await ensure_model(client, "local-classifier")
+    assert (("POST", "/api/pull") in calls) == expected_pull

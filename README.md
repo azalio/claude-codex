@@ -148,13 +148,20 @@ synthetic tool proposal. The evaluated command is substituted only into the capt
 request; its verdict is never sent to a tool executor. Five cloud models are tested
 by default, three times each, at low effort with concurrency two. Use repeated
 `--model NAME` arguments to select other models, `--repeats` to change the number
-of trials, or `--base-url` to select another Ollama server. Cloud requests use the
-Ollama account's quota. Model aliases are pulled before testing; local models may
-download weights. JSON results and a Markdown summary are saved privately under
+of trials, `--stage 2` to test the user-intent review, `--effort none` to disable
+thinking where supported, or `--base-url` to select another Ollama server.
+Cloud requests use the Ollama account's quota. Installed models and custom aliases are reused; missing
+models are pulled and local models may download weights. JSON results and a
+Markdown summary are saved privately under
 `~/.local/state/claude-codex/benchmarks/classifier-comparison/`.
 This synthetic test does not replay your session history or trust settings.
 The [measured comparison](docs/research/classifier-model-comparison-2026-10-03.md)
-contains results for the command above.
+contains results for the command above. Local classifiers need a sufficiently large
+active context for the full native policy; use a separate Modelfile alias with
+`PARAMETER num_ctx 65536` and verify it with `ollama ps`. A short-prompt speed
+test does not establish compatibility with auto mode. See the
+[local model measurements](docs/research/local-ollama-classifiers-2026-10-03.md)
+for both stages, latency, protocol failures, and false approvals.
 
 
 Configuration:

@@ -5,6 +5,8 @@ Command: `sl-review sourcecraft list-comments yc/quantum/pr/4427 --json --insecu
 The command was never executed. All models received the same native auto-mode
 policy and synthetic explicit-request context. This is a single-command protocol
 probe, not a classifier accuracy evaluation or a general speed benchmark.
+These are stage-1 harm scores: that stage ignores user intent and ALLOW exceptions.
+They do not establish the final stage-2 approval decision.
 Effort: low. Repeats: 3. Concurrency: 2.
 Vendor caching and server load were not controlled.
 
@@ -40,5 +42,6 @@ Run date: 2026-10-03. Ollama server: 0.34.4; Claude Code: 2.1.284.
 All 15 trials returned HTTP 200 and response.completed. Every model was routed through localhost Ollama,
 and these cloud model aliases used the Ollama cloud service. No ChatGPT OAuth credentials were used.
 Classifier policy instructions: 140,151 characters. No truncation or policy summarization was applied.
-Blocked results without a category are syntactically readable but omit the category requested by the policy.
+Some replies add a category despite the stage-1 cue requesting severity only.
+The scores are readable; exact stage-1 format compliance was not required by this harness.
 The test did not replay the user's actual session history, CLAUDE.md, or trust settings.

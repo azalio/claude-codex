@@ -43,7 +43,9 @@ def rewrite_command(value, command):
     return value
 
 
-def parse_verdict(text):
+def parse_verdict(text, *, stage=1):
+    if stage == 2:
+        text = re.sub(r"^\s*<thinking>[\s\S]*?</thinking>\s*", "", text)
     severity = re.fullmatch(
         r"\s*<severity>\s*(\d{1,3})\s*</severity>"
         r"(?:\s*<category>([^<>]+)</category>)?\s*", text,
@@ -63,16 +65,31 @@ class SyntheticAuth:
         return Tokens("synthetic", "synthetic", int(time.time() * 1000) + 60_000, "", "test")
 
 
-async def capture_request(command):
+async def capture_request(command, *, stage=1):
     """Claude proposes only a harmless marker; substitute after its request is captured."""
+    if stage not in (1, 2):
+        raise ValueError("Classifier stage must be 1 or 2")
     claude = shutil.which("claude")
     if not claude:
         raise RuntimeError("claude executable not found")
     captured = asyncio.get_running_loop().create_future()
+    classifier_calls = 0
 
     def upstream(request):
+        nonlocal classifier_calls
         payload = json.loads(request.content)
         if request.headers.get("x-claude-code-request-class") == "auxiliary":
+            classifier_calls += 1
+            if classifier_calls < stage:
+                # Synthetic stage-1 harm score triggers stage 2 in the isolated driver.
+                # Stage 2 is intercepted below; no verdict reaches a tool executor.
+                events = [
+                    {"type": "response.output_text.delta", "delta": "<severity>85</severity>"},
+                    {"type": "response.completed", "response": {"output": []}},
+                ]
+                return httpx.Response(
+                    200, text="".join("data: " + json.dumps(e) + "\n\n" for e in events),
+                )
             if not captured.done():
                 payload["input"] = rewrite_command(payload["input"], command)
                 if command not in json.dumps(payload["input"]):
@@ -162,13 +179,13 @@ async def capture_request(command):
                 sock.close()
 
 
-async def trial(client, payload, model, repeat, timeout):
+async def trial(client, payload, model, repeat, timeout, *, stage=1, effort="low"):
     request = {
         key: copy.deepcopy(value)
         for key, value in payload.items()
         if key in {"instructions", "input", "stream", "store", "text"}
     }
-    request.update(model=model, stream=True, store=False, reasoning={"effort": "low"})
+    request.update(model=model, stream=True, store=False, reasoning={"effort": effort})
     row = {"model": model, "repeat": repeat}
     start = time.perf_counter()
     try:
@@ -193,7 +210,7 @@ async def trial(client, payload, model, repeat, timeout):
                         break
                 text = "".join(chunks)
                 row["reply"] = text
-                row.update(parse_verdict(text))
+                row.update(parse_verdict(text, stage=stage))
                 if row.get("terminal") != "response.completed":
                     row["decision"] = "api_error"
     except (httpx.HTTPError, TimeoutError, ValueError) as exc:
@@ -210,7 +227,8 @@ def summary(metadata, rows):
         "The command was never executed. All models received the same native auto-mode",
         "policy and synthetic explicit-request context. This is a single-command protocol",
         "probe, not a classifier accuracy evaluation or a general speed benchmark.",
-        f"Effort: low. Repeats: {metadata['repeats']}. Concurrency: {metadata['concurrency']}.",
+        f"Stage: {metadata.get('stage', 1)}. Effort: {metadata.get('effort', 'low')}. "
+        f"Repeats: {metadata['repeats']}. Concurrency: {metadata['concurrency']}.",
         "Vendor caching and server load were not controlled.", "",
         f"Request SHA-256: {metadata['request_sha256']}", "",
         "| Model | Allow | Block | Valid verdicts | Severity range | Median seconds |",
@@ -235,13 +253,24 @@ def summary(metadata, rows):
     return "\n".join(lines) + "\n"
 
 
+async def ensure_model(client, model):
+    response = await client.get("/api/tags")
+    response.raise_for_status()
+    installed = {item["name"] for item in response.json().get("models", [])}
+    canonical = model if ":" in model.rsplit("/", 1)[-1] else model + ":latest"
+    if model in installed or canonical in installed:
+        return
+    response = await client.post("/api/pull", json={"model": model, "stream": False})
+    response.raise_for_status()
+
+
 async def run(args):
     if args.repeats < 1 or args.concurrency < 1 or args.timeout <= 0:
         raise ValueError("Repeats, concurrency, and timeout must be positive")
     args.output.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Capture stdout contains routing metadata only, but keep report output concise.
     with redirect_stdout(io.StringIO()):
-        payload = await capture_request(args.command)
+        payload = await capture_request(args.command, stage=args.stage)
     serialized = json.dumps(
         {"instructions": payload["instructions"], "input": payload["input"]},
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -251,7 +280,7 @@ async def run(args):
         "command": args.command, "request_sha256": digest,
         "started_at": datetime.now(UTC).isoformat(),
         "instructions_chars": len(payload["instructions"]),
-        "effort": "low", "repeats": args.repeats, "concurrency": args.concurrency,
+        "effort": args.effort, "stage": args.stage, "repeats": args.repeats, "concurrency": args.concurrency,
         "execution": "never executed; command substituted only after capture",
         "scenario": "synthetic explicit request; default auto-mode policy; no trusted environment overrides",
         "models": args.model or DEFAULT_MODELS,
@@ -272,8 +301,7 @@ async def run(args):
         ready = []
         for model in metadata["models"]:
             try:
-                response = await client.post("/api/pull", json={"model": model, "stream": False})
-                response.raise_for_status()
+                await ensure_model(client, model)
             except httpx.HTTPError as exc:
                 row = {"model": model, "decision": "pull_error", "error_type": type(exc).__name__}
                 if isinstance(exc, httpx.HTTPStatusError):
@@ -288,7 +316,10 @@ async def run(args):
         async def evaluate(model):
             for repeat in range(1, args.repeats + 1):
                 async with semaphore:
-                    row = await trial(client, payload, model, repeat, args.timeout)
+                    row = await trial(
+                        client, payload, model, repeat, args.timeout,
+                        stage=args.stage, effort=args.effort,
+                    )
                     rows.append(row)
                     save()
                     print(json.dumps(row), flush=True)
@@ -302,6 +333,8 @@ def main():
     parser.add_argument("--command", required=True, help="Text to classify; never executed")
     parser.add_argument("--model", action="append", help="Repeat to compare any Ollama model names")
     parser.add_argument("--base-url", default="http://127.0.0.1:11434")
+    parser.add_argument("--stage", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--effort", choices=("none", "low", "medium", "high"), default="low")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--timeout", type=float, default=180)

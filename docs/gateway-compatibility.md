@@ -34,6 +34,15 @@ reasoning; setting an auxiliary model alone selects low effort. Classifier compa
 and safety must be evaluated with the selected model; routing alone does not fix Stage 2
 errors or change permission policy.
 
+`CLAUDE_CODEX_AUXILIARY_ENDPOINT` optionally routes the auxiliary class to an
+independent Responses/SSE server, including Ollama's `/v1/responses`. The model
+and effort remain configurable through the auxiliary variables above. This endpoint
+receives the complete prompt but no ChatGPT authentication, account IDs, session
+hint headers, or Codex cache metadata. HTTP errors, malformed responses, and streams
+without terminal events are reported as errors; they never trigger an approval or
+fallback to another backend. Titles and auxiliary summaries share this route.
+Ollama `:cloud` models send inference to Ollama's cloud.
+
 ## Compatibility matrix
 
 | Gateway behavior | Bridge implementation | Limit |

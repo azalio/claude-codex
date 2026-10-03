@@ -320,6 +320,7 @@ def test_launcher_keeps_settings_private_and_cleans_up(
     monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
     monkeypatch.setenv("CLAUDE_CODE_USE_MANTLE", "1")
     monkeypatch.setenv("CLAUDE_CODE_AUTO_MODE_SERVER", "1")
+    monkeypatch.setenv("CLAUDE_CODEX_AUXILIARY_ENDPOINT", "http://localhost:11434/v1/responses")
     monkeypatch.setenv("CLAUDE_CODE_ATTRIBUTION_HEADER", "1")
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", f"X-Private: {header_secret}")
     captured_paths = []
@@ -345,6 +346,7 @@ def test_launcher_keeps_settings_private_and_cleans_up(
         assert pinned["CLAUDE_CODE_USE_VERTEX"] == "0"
         assert pinned["CLAUDE_CODE_USE_MANTLE"] == "0"
         assert pinned["CLAUDE_CODE_AUTO_MODE_SERVER"] == "0"
+        assert pinned["CLAUDE_CODEX_AUXILIARY_ENDPOINT"] == "http://localhost:11434/v1/responses"
         assert pinned["CLAUDE_CODE_ATTRIBUTION_HEADER"] == "0"
         assert pinned["CLAUDE_CODE_GATEWAY_HINT_HEADERS"] == "1"
         assert pinned["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] == "1"

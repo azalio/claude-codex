@@ -242,6 +242,8 @@ def main() -> None:
         overrides["ANTHROPIC_CUSTOM_HEADERS"] = env["ANTHROPIC_CUSTOM_HEADERS"]
         if context_identity:
             overrides["ANTHROPIC_MODEL"] = context_identity
+        if env.get("CLAUDE_CODEX_AUXILIARY_ENDPOINT"):
+            overrides["CLAUDE_CODEX_AUXILIARY_ENDPOINT"] = env["CLAUDE_CODEX_AUXILIARY_ENDPOINT"]
         with _proxy_settings_args(sys.argv[1:], overrides) as args:
             result = subprocess.run([claude, *args], env=env)
         raise SystemExit(result.returncode)

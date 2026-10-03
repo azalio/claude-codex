@@ -621,6 +621,40 @@ class CodexBackend:
         return summary
 
 
+class AuxiliaryResponsesBackend:
+    """Independent Responses endpoint with no ChatGPT authentication or metadata."""
+
+    def __init__(self, client: httpx.AsyncClient, endpoint: str) -> None:
+        self.client = client
+        self.endpoint = endpoint
+
+    async def events(
+        self, payload: dict[str, Any], identity: CodexRequestIdentity, *,
+        request_headers: dict[str, str] | None = None,
+    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        del identity, request_headers
+        allowed = {
+            "model", "instructions", "input", "stream", "store", "reasoning",
+            "tools", "tool_choice", "parallel_tool_calls", "text", "max_output_tokens",
+        }
+        request = {key: value for key, value in payload.items() if key in allowed}
+        if "reasoning" in request:
+            request["reasoning"] = {"effort": request["reasoning"]["effort"]}
+        async with self.client.stream(
+            "POST", self.endpoint, json=request, auth=None,
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        ) as response:
+            if response.is_error:
+                body = (await response.aread()).decode(errors="replace")
+                raise BackendError(response.status_code, body, response.headers)
+            yield UPSTREAM_HEADERS_EVENT, _response_headers(response.headers)
+            async for event, data in _sse(response):
+                yield event, data
+                if event in {"response.completed", "response.incomplete", "response.failed", "error"}:
+                    return
+            raise RuntimeError("Auxiliary stream ended without a terminal response event")
+
+
 def create_app(
     *,
     auth: AuthProvider | None = None,
@@ -636,6 +670,10 @@ def create_app(
         manager,
         http,
         endpoint or os.environ.get("CLAUDE_CODEX_ENDPOINT", CODEX_ENDPOINT),
+    )
+    auxiliary_endpoint = os.environ.get("CLAUDE_CODEX_AUXILIARY_ENDPOINT")
+    auxiliary_backend = (
+        AuxiliaryResponsesBackend(http, auxiliary_endpoint) if auxiliary_endpoint else None
     )
     installation_id = _resolve_installation_id(installation_id_path or INSTALLATION_ID_PATH)
     session_identities: dict[tuple[str, str, str, str], CodexRequestIdentity] = {}
@@ -1041,7 +1079,12 @@ def create_app(
             ) from exc
 
         async def response_events():
-            source = backend.events(upstream, identity, request_headers=hints)
+            selected_backend = (
+                auxiliary_backend
+                if auxiliary_backend is not None and identity.request_class == "auxiliary"
+                else backend
+            )
+            source = selected_backend.events(upstream, identity, request_headers=hints)
             try:
                 while True:
                     # Timer живёт только во время await: generator читается сначала

@@ -104,6 +104,26 @@ For example, to use the main model and medium effort for auxiliary requests too:
 CLAUDE_CODEX_AUXILIARY_MODEL=gpt-6.1-sol CLAUDE_CODEX_AUXILIARY_REASONING=medium claude-codex
 ```
 
+To route auxiliary requests through Ollama instead of ChatGPT, set a complete
+Responses endpoint URL and the model name independently. For example:
+
+```bash
+ollama pull deepseek-v4.1-flash:cloud
+CLAUDE_CODEX_AUXILIARY_ENDPOINT=http://127.0.0.1:11434/v1/responses \
+CLAUDE_CODEX_AUXILIARY_MODEL=deepseek-v4.1-flash:cloud \
+claude-codex --continue
+```
+
+Change `CLAUDE_CODEX_AUXILIARY_MODEL` to try another model on the same server;
+change `CLAUDE_CODEX_AUXILIARY_ENDPOINT` to use another compatible server.
+Restart the launcher after changing either. The endpoint must support streaming
+Responses events and the selected model must fit the full classifier prompt.
+ChatGPT OAuth credentials, account IDs, session hints, and Codex cache metadata
+are not sent to this endpoint. No automatic fallback or fabricated verdict is used
+on errors. The `:cloud` model above runs in Ollama's cloud, despite the localhost
+endpoint; use an installed local model for on-device inference. Other request classes
+keep the ChatGPT route. Unset the auxiliary endpoint to return to the Codex backend.
+
 Configuration:
 
 ```bash

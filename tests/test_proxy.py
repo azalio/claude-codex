@@ -1620,3 +1620,96 @@ async def test_local_checkpoint_budget_includes_added_prompt(monkeypatch, stream
     assert not oversized
     assert leaves
     assert normal[-1]["input"][-1]["content"][0]["text"] == "Context checkpoint summary:\ncheckpoint"
+
+
+@pytest.mark.parametrize("request_class", [None, "main", "subagent", "workflow", "compaction", "auxiliary"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("model", ["deepseek-v4.1-flash:cloud", "my-local-classifier:latest"])
+async def test_auxiliary_endpoint_isolated_from_codex_auth(monkeypatch, request_class, stream, model):
+    monkeypatch.setenv("CLAUDE_CODEX_AUXILIARY_ENDPOINT", "http://localhost:11434/v1/responses")
+    monkeypatch.setenv("CLAUDE_CODEX_AUXILIARY_MODEL", model)
+    monkeypatch.setenv("CLAUDE_CODEX_REASONING", "medium")
+    monkeypatch.delenv("CLAUDE_CODEX_AUXILIARY_REASONING", raising=False)
+    captured = []
+    auth = FakeAuth()
+    auth_calls = []
+
+    async def get(**kwargs):
+        auth_calls.append(kwargs)
+        return await FakeAuth().get(**kwargs)
+
+    auth.get = get
+
+    def upstream(request):
+        captured.append(request)
+        events = [
+            {"type": "response.output_text.delta", "output_index": 0, "delta": "VERDICT"},
+            {"type": "response.completed", "response": {"usage": {"input_tokens": 3, "output_tokens": 1}}},
+        ]
+        return httpx.Response(200, text="".join("data: " + json.dumps(e) + "\n\n" for e in events))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
+        app = create_app(auth=auth, client=http)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as c:
+            headers = {
+                "x-claude-code-session-id": "private-session",
+                "x-claude-code-agent-id": "private-agent",
+            }
+            if request_class:
+                headers["x-claude-code-request-class"] = request_class
+            r = await c.post("/v1/messages", headers=headers, json={
+                "model": "claude-codex", "stream": stream,
+                "messages": [{"role": "user", "content": "Synthetic check."}],
+            })
+    assert r.status_code == 200
+    assert "VERDICT" in r.text
+    assert len(captured) == 1
+    req = captured[0]
+    payload = json.loads(req.content)
+    if request_class == "auxiliary":
+        assert str(req.url) == "http://localhost:11434/v1/responses"
+        assert not auth_calls
+        assert "authorization" not in req.headers
+        assert "chatgpt-account-id" not in req.headers
+        assert not any(k.startswith("x-claude-code-") or k.startswith("x-codex-") for k in req.headers)
+        assert "client_metadata" not in payload
+        assert "prompt_cache_key" not in payload
+        assert "include" not in payload
+        assert payload["model"] == model
+        assert payload["reasoning"] == {"effort": "low"}
+    else:
+        assert req.url.host == "chatgpt.com"
+        assert auth_calls
+        assert req.headers["authorization"] == "Bearer access"
+
+
+@pytest.mark.parametrize("status, text", [
+    (404, '{"error":"model not found"}'),
+    (200, 'data: {"type":"response.created"}\n\n'),
+    (200, 'data: not-json\n\n'),
+])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_auxiliary_endpoint_errors_do_not_fallback_or_allow(monkeypatch, status, text, stream):
+    monkeypatch.setenv("CLAUDE_CODEX_AUXILIARY_ENDPOINT", "http://localhost:11434/v1/responses")
+    calls = []
+
+    def upstream(request):
+        calls.append(request)
+        return httpx.Response(status, text=text)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
+        app = create_app(auth=FakeAuth(), client=http)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy"
+        ) as c:
+            r = await c.post(
+                "/v1/messages", headers={"x-claude-code-request-class": "auxiliary"},
+                json={"model": "claude-codex", "stream": stream,
+                      "messages": [{"role": "user", "content": "Check."}]},
+            )
+    if stream and status == 200:
+        assert "event: error" in r.text
+    else:
+        assert r.status_code >= 400
+    assert len(calls) == 1
+    assert calls[0].url.host == "localhost"

@@ -108,3 +108,35 @@ claude-codex --continue
 
 The launcher defaults auxiliary requests to GPT-6 Luna / low; main reasoning remains medium.
 See [README](../../README.md) for overrides and scope. Relaunch to apply it to an existing session.
+
+
+## Independent Ollama endpoint follow-up
+
+The auxiliary endpoint and model are independent overrides; there is no hardcoded
+DeepSeek selection. Main, subagent, workflow, compaction, and headerless requests
+retain the Codex backend. The auxiliary Responses adapter excludes OAuth, account
+headers, native session hints, encrypted-reasoning requests, and Codex cache metadata.
+Errors do not cause an approval or fallback.
+
+Ollama 0.34.4 successfully pulled the cloud model manifest for
+deepseek-v4.1-flash:cloud. Installed Claude Code 2.1.284 sent its actual 140,151-character
+classifier instructions through this endpoint without truncation. The first-stage
+backend call completed in 1.650 seconds and the CLI executed the harmless marker.
+A separate controlled first-stage result triggered the real second stage, which
+completed in 1.296 seconds and also allowed the marker. Main model replies were
+mocked for deterministic tool selection; outgoing main payloads remained GPT-6.1 Sol /
+medium. These probes do not establish classifier safety or representative latency.
+
+Private metadata artifacts are ollama-results.json and ollama-stage2-results.json in
+the same private benchmark directory above. The full suite has 203 passing tests,
+including both streaming modes, two independently configured model names, endpoint
+isolation, credential exclusion, and errors; Ruff and diff checks pass.
+
+The selected model runs in Ollama's cloud, not on-device. See
+[the model card](https://ollama.com/library/deepseek-v4.1-flash:cloud) and
+[Ollama Responses support](https://docs.ollama.com/api/openai-compatibility).
+Nimble was not installed: its specialized decision endpoint limits prompts to 8,192
+tokens and request bodies to 64 KiB, below the observed classifier instructions alone,
+and requires Ollama 0.35 or later. Its decision API also cannot generate the auxiliary
+titles and summaries handled by this shared request class.
+[Nimble documentation](https://ollama.com/library/nimble).

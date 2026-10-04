@@ -120,7 +120,7 @@ OpenCode and Codex credential files are read-only inputs. Refreshed credentials 
 - `pyproject.toml` defines package metadata, Python version, dependencies, console scripts, pytest
   configuration, and lint rules.
 - `uv.lock` pins the resolved Python dependency set used by `install.sh`.
-- `README.md` is the user-facing contract for authentication, install, use, and backend caveats.
+- `docs/configuration.md` is the detailed user-facing contract for authentication, install, use, and backend caveats; `README.md` is the project homepage.
 - `src/claude_codex/*.py` is the runtime implementation.
 - `tests/*.py` is the executable specification for supported auth, proxy, and translation behavior.
 

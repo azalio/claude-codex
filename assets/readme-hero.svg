@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 400" role="img" aria-labelledby="title desc">
+  <title id="title">claude-codex</title>
+  <desc id="desc">Claude Code, powered by your ChatGPT subscription. Launch with claude-codex --continue.</desc>
+  <rect width="1200" height="400" rx="24" fill="#151b19"/>
+  <path d="M64 72h64" stroke="#b6e7c9" stroke-width="6" stroke-linecap="round"/>
+  <text x="64" y="176" fill="#f4f3eb" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="88" font-weight="700" letter-spacing="-4">claude-codex</text>
+  <text x="68" y="232" fill="#b6e7c9" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="32">Your workflow. Your Codex backend.</text>
+  <rect x="64" y="282" width="1072" height="64" rx="12" fill="#222c27" stroke="#3b4b41"/>
+  <text x="88" y="324" fill="#b6e7c9" font-family="Menlo, Consolas, monospace" font-size="26">$</text>
+  <text x="124" y="324" fill="#f4f3eb" font-family="Menlo, Consolas, monospace" font-size="26">claude-codex --continue</text>
+</svg>

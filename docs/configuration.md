@@ -138,6 +138,17 @@ tail -f ~/.local/state/claude-codex/proxy.log | rg 'proxy_upstream'
 ```
 
 
+Auxiliary request bodies and raw Responses SSE events are also recorded by default in
+`~/.local/state/claude-codex/auxiliary/requests.jsonl`. Request and response entries
+share the `request_id` from `proxy_upstream`, so you can inspect the actual classifier
+reply. This includes auxiliary titles and summaries as well as classifier checks.
+The private directory uses mode 0700 and files use mode 0600. Logs rotate at 10 MiB
+with one backup; a single larger record is retained intact. Authorization headers,
+OAuth/account credentials, endpoint queries, and Codex routing/cache metadata are excluded.
+Prompt and response content is stored verbatim and can contain sensitive task data.
+Set `CLAUDE_CODEX_AUXILIARY_LOG=0` to disable this recording.
+Restart the launcher to enable the updated code; earlier replies cannot be recovered.
+
 Compare classifier models without executing the command under evaluation:
 
 ```bash

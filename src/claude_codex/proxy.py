@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from .auth import AuthError, AuthManager, AuthProvider
+from .auxiliary_log import request_payload, write_record
 from .checkpoint import CheckpointCache
 from .tls import upstream_ssl_context
 from .translate import (
@@ -677,13 +678,7 @@ class AuxiliaryResponsesBackend:
         request_headers: dict[str, str] | None = None,
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         del identity, request_headers
-        allowed = {
-            "model", "instructions", "input", "stream", "store", "reasoning",
-            "tools", "tool_choice", "parallel_tool_calls", "text", "max_output_tokens",
-        }
-        request = {key: value for key, value in payload.items() if key in allowed}
-        if "reasoning" in request:
-            request["reasoning"] = {"effort": request["reasoning"]["effort"]}
+        request = request_payload(payload)
         async with self.client.stream(
             "POST", self.endpoint, json=request, auth=None,
             headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
@@ -1149,6 +1144,9 @@ def create_app(
                 print("proxy_upstream " + json.dumps(record, ensure_ascii=True), flush=True)
 
             log("start")
+            capture = identity.request_class == "auxiliary"
+            if capture:
+                write_record(metadata, "request", payload=request_payload(upstream))
             result = "cancelled"
             details: dict[str, Any] = {}
             source = selected_backend.events(upstream, identity, request_headers=hints)
@@ -1161,6 +1159,8 @@ def create_app(
                     except StopAsyncIteration:
                         return
                     name, data = event
+                    if capture and name != UPSTREAM_HEADERS_EVENT:
+                        write_record(metadata, "response_event", name=name, data=data)
                     if name in {"response.completed", "response.incomplete", "response.failed", "error"}:
                         result = name.removeprefix("response.")
                         response = data.get("response")
@@ -1179,11 +1179,22 @@ def create_app(
                 details["error_type"] = type(exc).__name__
                 if isinstance(exc, BackendError):
                     details["http_status"] = exc.status_code
+                    if capture:
+                        write_record(
+                            metadata, "response_error",
+                            http_status=exc.status_code, body=exc.body,
+                        )
                 raise
             finally:
                 try:
                     await source.aclose()
                 finally:
+                    if capture:
+                        write_record(
+                            metadata, "end", result=result,
+                            duration_ms=round((asyncio.get_running_loop().time() - started) * 1000),
+                            **details,
+                        )
                     log(
                         "end", result=result,
                         duration_ms=round((asyncio.get_running_loop().time() - started) * 1000),

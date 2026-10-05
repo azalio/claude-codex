@@ -25,6 +25,9 @@ def isolated_installation_id(monkeypatch, tmp_path: Path) -> Path:
     path = tmp_path / "installation_id"
     monkeypatch.setattr("claude_codex.proxy.INSTALLATION_ID_PATH", path)
     monkeypatch.setattr("claude_codex.proxy.CHECKPOINT_CACHE_PATH", tmp_path / "checkpoints")
+    monkeypatch.setattr(
+        "claude_codex.auxiliary_log.AUXILIARY_LOG_PATH", tmp_path / "auxiliary/requests.jsonl"
+    )
     return path
 
 
@@ -1648,7 +1651,9 @@ async def test_local_checkpoint_budget_includes_added_prompt(monkeypatch, stream
 @pytest.mark.parametrize("request_class", [None, "main", "subagent", "workflow", "compaction", "auxiliary"])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("model", ["deepseek-v4.1-flash:cloud", "my-local-classifier:latest"])
-async def test_auxiliary_endpoint_isolated_from_codex_auth(monkeypatch, request_class, stream, model, capsys):
+async def test_auxiliary_endpoint_isolated_from_codex_auth(
+    monkeypatch, request_class, stream, model, capsys, tmp_path
+):
     monkeypatch.setenv("CLAUDE_CODEX_AUXILIARY_ENDPOINT", "http://localhost:11434/v1/responses")
     monkeypatch.setenv("CLAUDE_CODEX_AUXILIARY_MODEL", model)
     monkeypatch.setenv("CLAUDE_CODEX_REASONING", "medium")
@@ -1700,6 +1705,20 @@ async def test_auxiliary_endpoint_isolated_from_codex_auth(monkeypatch, request_
     assert logs[1]["duration_ms"] >= 0
     assert "VERDICT" not in json.dumps(logs)
     assert "Synthetic check." not in json.dumps(logs)
+    audit_path = tmp_path / "auxiliary/requests.jsonl"
+    if request_class == "auxiliary":
+        records = [json.loads(line) for line in audit_path.read_text().splitlines()]
+        assert records[0]["event"] == "request"
+        assert records[0]["payload"] == payload
+        assert records[1]["data"]["delta"] == "VERDICT"
+        assert records[-1]["result"] == "completed"
+        assert all(r["request_id"] == logs[0]["request_id"] for r in records)
+        assert audit_path.stat().st_mode & 0o777 == 0o600
+        assert audit_path.parent.stat().st_mode & 0o777 == 0o700
+        assert "client_metadata" not in records[0]["payload"]
+        assert "prompt_cache_key" not in records[0]["payload"]
+    else:
+        assert not audit_path.exists()
     assert logs[0]["backend"] == ("auxiliary" if request_class == "auxiliary" else "codex")
     if request_class == "auxiliary":
         assert logs[0]["endpoint_origin"] == "http://localhost:11434"

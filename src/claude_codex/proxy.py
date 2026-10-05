@@ -27,6 +27,7 @@ from .auth import AuthError, AuthManager, AuthProvider
 from .auxiliary_log import request_payload, write_record
 from .checkpoint import CheckpointCache
 from .classifier import DEFAULT_CLASSIFIER_MODEL, classifier_events, is_classifier_request
+from .models import ModelCatalog
 from .tls import upstream_ssl_context
 from .translate import (
     AnthropicStream,
@@ -790,6 +791,7 @@ def create_app(
         http,
         endpoint or os.environ.get("CLAUDE_CODEX_ENDPOINT", CODEX_ENDPOINT),
     )
+    catalog = ModelCatalog(manager, http, backend.endpoint)
     auxiliary_endpoint = os.environ.get("CLAUDE_CODEX_AUXILIARY_ENDPOINT")
     auxiliary_backend = (
         AuxiliaryResponsesBackend(http, auxiliary_endpoint) if auxiliary_endpoint else None
@@ -956,26 +958,22 @@ def create_app(
 
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:
-        # Показываем один реально настроенный backend, а не список Claude-моделей.
         model = os.environ.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
-        alias = os.environ.get("ANTHROPIC_MODEL") or "claude-codex"
-        if not any(name in alias.lower() for name in ("claude", "anthropic")):
-            alias = "claude-codex"
+        entries = await catalog.list()
+        if not entries:
+            alias = os.environ.get("ANTHROPIC_MODEL") or "claude-codex"
+            if not any(name in alias.lower() for name in ("claude", "anthropic")):
+                alias = "claude-codex"
+            entries = [{
+                "type": "model", "id": alias, "display_name": f"Codex: {model}",
+                "description": (
+                    f"Routes to {model} via the Codex subscription; "
+                    "Anthropic server safeguards are unavailable."
+                ),
+            }]
         return {
-            "data": [
-                {
-                    "type": "model",
-                    "id": alias,
-                    "display_name": f"Codex: {model}",
-                    "description": (
-                        f"Routes to {model} via the Codex subscription; "
-                        "Anthropic server safeguards are unavailable."
-                    ),
-                }
-            ],
-            "has_more": False,
-            "first_id": alias,
-            "last_id": alias,
+            "data": entries, "has_more": False,
+            "first_id": entries[0]["id"], "last_id": entries[-1]["id"],
         }
 
     @app.post("/v1/messages/count_tokens", response_model=None)
@@ -1146,7 +1144,11 @@ def create_app(
         if isinstance(body, JSONResponse):
             return body
         requested_model = str(body.get("model") or "claude-codex")
-        codex_model = os.environ.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
+        try:
+            selected_model = await catalog.resolve(requested_model)
+        except ValueError as exc:
+            return invalid_request(str(exc))
+        codex_model = selected_model or os.environ.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
         requested_effort = (body.get("output_config") or {}).get("effort", "medium")
         reasoning = os.environ.get("CLAUDE_CODEX_REASONING") or (
             "xhigh" if requested_effort == "max" else requested_effort

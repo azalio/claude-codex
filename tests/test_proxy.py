@@ -1127,12 +1127,13 @@ async def test_auxiliary_routing_keeps_main_and_other_request_classes_unchanged(
     assert captured[0]["reasoning"]["effort"] == expected_effort
 
 
-async def test_startup_probe_and_discovery_report_only_the_configured_backend(monkeypatch) -> None:
+async def test_startup_probe_and_discovery_fallback_to_the_configured_backend(monkeypatch) -> None:
     monkeypatch.setenv("CLAUDE_CODEX_MODEL", "gpt-test-backend")
     monkeypatch.setenv("ANTHROPIC_MODEL", "anthropic-codex-alias")
 
     def upstream(_: httpx.Request) -> httpx.Response:
-        pytest.fail("Startup endpoints must not call inference")
+        assert _.method == "GET" and _.url.path.endswith("/models")
+        return httpx.Response(503)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
         app = create_app(auth=FakeAuth(), client=upstream_client)

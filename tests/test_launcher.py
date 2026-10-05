@@ -351,6 +351,8 @@ def test_launcher_keeps_settings_private_and_cleans_up(
         assert pinned["CLAUDE_CODE_GATEWAY_HINT_HEADERS"] == "1"
         assert pinned["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] == "1"
         assert pinned["ENABLE_TOOL_SEARCH"] == "false"
+        assert pinned["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+        assert pinned["CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_TIMEOUT_MS"] == "10000"
         assert "X-Session-Id:" in pinned["ANTHROPIC_CUSTOM_HEADERS"]
         assert header_secret in pinned["ANTHROPIC_CUSTOM_HEADERS"]
         assert all(env[key] == value for key, value in pinned.items() if key != "MCP_SERVICE_TOKEN")

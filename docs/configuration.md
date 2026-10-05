@@ -32,8 +32,21 @@ function-tool form. Existing permissions, hooks, and persistent settings files r
 
 The proxy supports native session/agent routing, streaming with keep-alive pings, HTTP error and
 retry controls, JSON-schema structured outputs, strict function tools, effort translation, and
-`/v1/models` discovery. Discovery remains opt-in with `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`
-and reports the configured Codex backend. Token counts remain character-based estimates.
+`/v1/models` discovery. The launcher enables discovery by default. Run `/model` to choose from the visible
+models returned by your ChatGPT subscription catalog. Selection changes the main and subagent
+backend; auxiliary summaries and the auto mode classifier retain their own model settings.
+Claude Code requires discovered IDs to contain `claude` or `anthropic`, so the proxy uses
+`claude-codex/<model>` IDs while displaying the catalog's model names. Hidden service models
+such as `codex-auto-review` are omitted.
+
+Catalog results are cached in memory for five minutes. If discovery fails, the proxy retains
+its last successful list, or reports the configured backend when no list has been fetched.
+Unknown catalog aliases are rejected rather than silently routed to the default model.
+The launcher gives discovery 10 seconds; the catalog fetch has an 8-second total timeout.
+Set `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0` to disable discovery, or override
+`CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_TIMEOUT_MS` if needed. The catalog compatibility
+version defaults to `0.160.0` and can be changed with
+`CLAUDE_CODEX_CATALOG_CLIENT_VERSION`. Token counts remain character-based estimates.
 
 See the [compatibility matrix](gateway-compatibility.md) for supported behavior and limits,
 mapped to the [Claude Code gateway guide](https://code.claude.com/docs/en/llm-gateway-protocol).

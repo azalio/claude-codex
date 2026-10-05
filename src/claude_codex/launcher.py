@@ -224,6 +224,12 @@ def main() -> None:
             "CLAUDE_CODE_GATEWAY_HINT_HEADERS": "1",
             "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
             "ENABLE_TOOL_SEARCH": "false",
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": (
+                env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY") or "1"
+            ),
+            "CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_TIMEOUT_MS": (
+                env.get("CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_TIMEOUT_MS") or "10000"
+            ),
             "DISABLE_TELEMETRY": "1",
             "DISABLE_ERROR_REPORTING": "1",
         }

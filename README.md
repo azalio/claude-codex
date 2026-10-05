@@ -49,8 +49,8 @@ Choose another model or reasoning level when you launch:
 CLAUDE_CODEX_MODEL=gpt-6.1-sol CLAUDE_CODEX_REASONING=high claude-codex
 ```
 
-Auxiliary requests, including auto-mode classifier checks, use
-`gpt-6-luna` with `low` reasoning by default.
+Auto-mode classifier checks use **`codex-auto-review` with `low` reasoning**.
+Other auxiliary requests use `gpt-6-luna` with `low` reasoning.
 See [model configuration](docs/configuration.md#use) for overrides and Ollama routing.
 
 ## How it works

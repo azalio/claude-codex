@@ -26,6 +26,7 @@ from starlette.background import BackgroundTask
 from .auth import AuthError, AuthManager, AuthProvider
 from .auxiliary_log import request_payload, write_record
 from .checkpoint import CheckpointCache
+from .classifier import DEFAULT_CLASSIFIER_MODEL, classifier_events, is_classifier_request
 from .tls import upstream_ssl_context
 from .translate import (
     AnthropicStream,
@@ -694,12 +695,91 @@ class AuxiliaryResponsesBackend:
             raise RuntimeError("Auxiliary stream ended without a terminal response event")
 
 
+class ClassifierChatBackend:
+    """Tool-less JSON-schema Chat Completions endpoint for local classifiers."""
+
+    def __init__(self, client: httpx.AsyncClient, endpoint: str) -> None:
+        self.client = client
+        self.endpoint = endpoint
+
+    def diagnostic_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        def has_image(value: Any) -> bool:
+            if isinstance(value, dict):
+                return value.get("type") == "input_image" or any(has_image(v) for v in value.values())
+            return isinstance(value, list) and any(has_image(v) for v in value)
+
+        if has_image(payload["input"]):
+            raise ValueError("Chat classifier endpoint cannot flatten image evidence")
+        return {
+            "model": payload["model"],
+            "messages": [
+                {"role": "system", "content": payload["instructions"]},
+                {"role": "user", "content": "Original review evidence with roles preserved as JSON:\n"
+                 + json.dumps(payload["input"], ensure_ascii=False)},
+            ],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "reasoning_effort": payload["reasoning"]["effort"],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "classifier_verdict", "strict": True,
+                    "schema": payload["text"]["format"]["schema"],
+                },
+            },
+        }
+
+    async def events(
+        self, payload: dict[str, Any], identity: CodexRequestIdentity, *,
+        request_headers: dict[str, str] | None = None,
+    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        del identity, request_headers
+        async with self.client.stream(
+            "POST", self.endpoint, json=self.diagnostic_payload(payload), auth=None,
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        ) as response:
+            if response.is_error:
+                raise BackendError(response.status_code, (await response.aread()).decode(errors="replace"),
+                                   response.headers)
+            yield UPSTREAM_HEADERS_EVENT, _response_headers(response.headers)
+            finish_reason = None
+            usage = None
+            model = payload["model"]
+            async for _, data in _sse(response):
+                yield "classifier.chat_chunk", data
+                if data.get("error"):
+                    yield "error", data
+                    return
+                model = data.get("model", model)
+                usage = data.get("usage") or usage
+                for choice in data.get("choices", []):
+                    delta = choice.get("delta", {})
+                    if delta.get("tool_calls"):
+                        raise RuntimeError("Classifier returned tool calls")
+                    if text := delta.get("content"):
+                        yield "response.output_text.delta", {"delta": text}
+                    finish_reason = choice.get("finish_reason") or finish_reason
+            if finish_reason != "stop":
+                yield "response.incomplete", {"response": {
+                    "status": "incomplete", "incomplete_details": {"reason": finish_reason},
+                }}
+                return
+            yield "response.completed", {"response": {
+                "model": model, "status": "completed", "output": [],
+                "usage": {
+                    "input_tokens": (usage or {}).get("prompt_tokens", 0),
+                    "output_tokens": (usage or {}).get("completion_tokens", 0),
+                },
+            }}
+
+
 def create_app(
     *,
     auth: AuthProvider | None = None,
     client: httpx.AsyncClient | None = None,
     endpoint: str | None = None,
     startup_id: str | None = None,
+    classifier_review: bool = True,
     installation_id_path: Path | None = None,
 ) -> FastAPI:
     owns_client = client is None
@@ -1094,6 +1174,15 @@ def create_app(
             reasoning_effort=reasoning,
             prompt_cache_key=session_identity.cache_key,
         )
+        classifier = (
+            classifier_review and session_identity.request_class == "auxiliary"
+            and is_classifier_request(upstream)
+        )
+        if classifier:
+            codex_model = os.environ.get("CLAUDE_CODEX_CLASSIFIER_MODEL") or DEFAULT_CLASSIFIER_MODEL
+            reasoning = os.environ.get("CLAUDE_CODEX_CLASSIFIER_REASONING") or "low"
+            upstream["model"] = codex_model
+            upstream["reasoning"] = {"effort": reasoning}
         compaction_state = compaction_state_for(
             session_source,
             session_id,
@@ -1123,6 +1212,16 @@ def create_app(
                 if auxiliary_backend is not None and identity.request_class == "auxiliary"
                 else backend
             )
+            if classifier:
+                classifier_endpoint = os.environ.get("CLAUDE_CODEX_CLASSIFIER_ENDPOINT")
+                if classifier_endpoint:
+                    backend_type = (
+                        ClassifierChatBackend if classifier_endpoint.rstrip("/").endswith("/chat/completions")
+                        else AuxiliaryResponsesBackend
+                    )
+                    selected_backend = backend_type(http, classifier_endpoint)
+                else:
+                    selected_backend = backend
             url = httpx.URL(selected_backend.endpoint)
             host = f"[{url.host}]" if ":" in url.host else url.host
             origin = f"{url.scheme}://{host}" + (f":{url.port}" if url.port else "")
@@ -1130,7 +1229,9 @@ def create_app(
                 "request_id": uuid.uuid4().hex,
                 "session_id": identity.session_id,
                 "request_class": identity.request_class,
-                "backend": "auxiliary" if selected_backend is auxiliary_backend else "codex",
+                "backend": "classifier" if classifier else (
+                    "auxiliary" if selected_backend is auxiliary_backend else "codex"
+                ),
                 "model": codex_model,
                 "effort": reasoning,
                 "endpoint_origin": origin,
@@ -1144,12 +1245,15 @@ def create_app(
                 print("proxy_upstream " + json.dumps(record, ensure_ascii=True), flush=True)
 
             log("start")
-            capture = identity.request_class == "auxiliary"
+            capture = identity.request_class == "auxiliary" and not classifier
             if capture:
                 write_record(metadata, "request", payload=request_payload(upstream))
             result = "cancelled"
             details: dict[str, Any] = {}
-            source = selected_backend.events(upstream, identity, request_headers=hints)
+            source = (
+                classifier_events(selected_backend, upstream, identity, hints, metadata)
+                if classifier else selected_backend.events(upstream, identity, request_headers=hints)
+            )
             try:
                 while True:
                     # Timer lives only during await: the consumer changes tasks between yields.

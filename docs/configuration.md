@@ -91,14 +91,13 @@ to choose another level; it takes precedence over the client effort. Restart
 `claude-codex` to apply a changed default or override to an existing session.
 
 Auxiliary requests default to `gpt-6-luna` with `low` reasoning when launched
-with `claude-codex`. This includes auto-mode classifiers, session titles, and auxiliary
-summaries carrying `x-claude-code-request-class: auxiliary`. The main model,
+with `claude-codex`. This includes session titles and auxiliary summaries carrying
+`x-claude-code-request-class: auxiliary`. Recognized auto-mode classifiers use the
+separate reviewer route described below. The main model,
 subagents, workflows, and compaction keep their existing routing. Set
 `CLAUDE_CODEX_AUXILIARY_MODEL` and `CLAUDE_CODEX_AUXILIARY_REASONING` to
 override these defaults. Nonempty explicit values take precedence; restart the launcher
-to apply them. The launcher enables the required gateway hint headers. A lighter model
-is experimental for Claude Code's classifier; it does not guarantee fewer denials or
-equivalent safety.
+to apply them. The launcher enables the required gateway hint headers.
 
 For example, to use the main model and medium effort for auxiliary requests too:
 
@@ -119,12 +118,62 @@ claude-codex --continue
 Change `CLAUDE_CODEX_AUXILIARY_MODEL` to try another model on the same server;
 change `CLAUDE_CODEX_AUXILIARY_ENDPOINT` to use another compatible server.
 Restart the launcher after changing either. The endpoint must support streaming
-Responses events and the selected model must fit the full classifier prompt.
+Responses events and the selected model must fit the complete auxiliary prompt.
+These settings do not change the separate classifier route.
 ChatGPT OAuth credentials, account IDs, session hints, and Codex cache metadata
 are not sent to this endpoint. No automatic fallback or fabricated verdict is used
 on errors. The `:cloud` model above runs in Ollama's cloud, despite the localhost
 endpoint; use an installed local model for on-device inference. Other request classes
 keep the ChatGPT route. Unset the auxiliary endpoint to return to the Codex backend.
+
+### Auto-mode classifier
+
+Recognized Claude Code classifier requests use `codex-auto-review` with `low`
+reasoning through the ChatGPT subscription by default. This is the preferred reviewer
+model in Codex's ChatGPT provider. Main answers, compaction, titles, and ordinary
+auxiliary summaries retain their own routes.
+
+The reviewer retains the complete classifier policy and evidence, requests JSON Schema,
+validates the score and category, and converts a valid result to Claude Code's native
+`<severity>...</severity>` / optional `<category>...</category>` format.
+The policy, numeric scores, and allow/block thresholds are preserved. Valid native XML
+is also accepted from providers that ignore the schema. Partial or malformed responses
+never become verdicts. Formatting/incomplete-response and transient transport/server
+errors get up to three attempts within one 90-second deadline. A valid deny is not retried.
+Exhaustion returns a review error, without fabricating an allow or deny or switching models.
+
+Classifier recognition uses the trusted system instruction's native numeric severity
+output contract together with the auxiliary request-class hint. Other auxiliary prompts
+are unaffected. A future Claude Code contract change may require updating recognition.
+
+- `CLAUDE_CODEX_CLASSIFIER_MODEL`: reviewer model; default `codex-auto-review`.
+- `CLAUDE_CODEX_CLASSIFIER_REASONING`: effort; default `low`.
+- `CLAUDE_CODEX_CLASSIFIER_ENDPOINT`: optional full independent endpoint URL.
+  Unset it to use ChatGPT, regardless of `CLAUDE_CODEX_AUXILIARY_ENDPOINT`.
+- `CLAUDE_CODEX_CLASSIFIER_TIMEOUT`: positive seconds for the total deadline;
+  default 90. Invalid, nonpositive, and nonfinite values use the default.
+
+For a local Ollama classifier with constrained JSON generation, use Chat Completions:
+
+```bash
+CLAUDE_CODEX_CLASSIFIER_ENDPOINT=http://127.0.0.1:11434/v1/chat/completions \
+CLAUDE_CODEX_CLASSIFIER_MODEL=auto-mode-bench-qwen3-5-4b \
+CLAUDE_CODEX_CLASSIFIER_REASONING=none \
+claude-codex --continue
+```
+
+The example alias was created by the local benchmark with a 65,536-token context.
+On another machine, create an alias with enough context for the full policy and evidence.
+Replace the model name to try another installed model. The Chat Completions adapter
+sends the complete text evidence with its original roles serialized as JSON; image
+evidence is rejected explicitly rather than flattened or dropped.
+A `/v1/responses` endpoint can also be used if it supports the requested schema.
+Independent endpoints receive no ChatGPT credentials or routing metadata.
+
+Private diagnostic records include each attempt, raw response events, `invalid_format`
+errors and the accepted `verdict` with its score, category and rationale.
+The payload-free `classifier_review` lines in `proxy.log` report validation outcomes.
+A format-valid answer is not a guarantee of correct policy judgment.
 
 Forwarded requests write structured lines prefixed with `proxy_upstream` to
 `~/.local/state/claude-codex/proxy.log`: request start and backend result,

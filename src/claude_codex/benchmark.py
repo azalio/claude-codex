@@ -130,7 +130,7 @@ async def capture_request(command, *, stage=1):
         async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
             app = create_app(
                 auth=SyntheticAuth(), client=http, endpoint="http://capture.test/responses",
-                installation_id_path=Path(directory) / "installation_id",
+                installation_id_path=Path(directory) / "installation_id", classifier_review=False,
             )
             sock = socket.socket()
             sock.bind(("127.0.0.1", 0))

@@ -30,7 +30,8 @@ each default. These select a separate backend and effort for
 `x-claude-code-request-class: auxiliary`. This class also includes titles and auxiliary
 summaries, so it is broader than auto-mode checks. Requests without hints stay on the
 main route. A standalone proxy without these variables retains the main model and
-reasoning; setting an auxiliary model alone selects low effort. Classifier compatibility
+reasoning; setting an auxiliary model alone selects low effort. Recognized classifier
+requests instead use the independent `codex-auto-review` / `low` route. Classifier compatibility
 and safety must be evaluated with the selected model; routing alone does not fix Stage 2
 errors or change permission policy.
 
@@ -40,8 +41,16 @@ and effort remain configurable through the auxiliary variables above. This endpo
 receives the complete prompt but no ChatGPT authentication, account IDs, session
 hint headers, or Codex cache metadata. HTTP errors, malformed responses, and streams
 without terminal events are reported as errors; they never trigger an approval or
-fallback to another backend. Titles and auxiliary summaries share this route.
+fallback to another backend. Titles and auxiliary summaries share this route;
+recognized classifiers are controlled by `CLAUDE_CODEX_CLASSIFIER_*` instead.
 Ollama `:cloud` models send inference to Ollama's cloud.
+
+The classifier route validates a JSON-schema verdict before translating it to native
+severity/category XML. Malformed or incomplete replies are retried up to three times
+within a shared 90-second deadline; valid denials are final. Exhaustion produces a
+review error, with no fabricated verdict or model fallback. Independent classifier
+endpoints support Responses or schema-constrained Chat Completions; the latter rejects
+image evidence explicitly. See [classifier configuration](configuration.md#auto-mode-classifier).
 
 ## Compatibility matrix
 
@@ -60,7 +69,7 @@ Ollama `:cloud` models send inference to Ollama's cloud.
 | Tool search | Launcher pins `ENABLE_TOOL_SEARCH=false`; ordinary MCP function tools remain available | `defer_loading`, `tool_reference`, and provider tool-search tools return explicit errors |
 | Effort and thinking | The launcher pins Codex effort to `medium` by default; `CLAUDE_CODEX_REASONING` selects another level | The gateway override wins over client effort, including implicit `max`. Standalone proxy requests without an override honor explicit client effort (`max` maps to `xhigh`) and default to `medium` when omitted; Anthropic thinking budgets/signatures are not forwarded or fabricated |
 | Structured outputs | JSON-schema `output_config.format` maps to Responses `text.format`, with strict validation requested | Other formats and Anthropic task budgets are unsupported |
-| Context management | Proxy compaction checks previous usage and current input/instructions/tool estimates at 180k by default; auxiliary/classifier requests are excluded; large native compaction histories use bounded segment summaries; Anthropic `context_management` returns HTTP 400 | Native recovery has a four-minute total deadline and aborts on failed/incomplete segments; native final requests omit checkpointed tool schemas and use compact-only instructions if needed; oversized image histories and remaining checkpoint/format text return explicit errors; checkpoint summaries are lossy and do not inherit user JSON-output schemas |
+| Context management | Proxy compaction checks previous usage and current input/instructions/tool estimates at 180k by default; auxiliary/classifier requests are excluded; large native compaction histories use bounded segment summaries; Anthropic `context_management` returns HTTP 400 | Native recovery has a configurable 15-minute total deadline by default and aborts on failed/incomplete segments; native final requests omit checkpointed tool schemas and use compact-only instructions if needed; oversized image histories and remaining checkpoint/format text return explicit errors; checkpoint summaries are lossy and do not inherit user JSON-output schemas |
 | Prompt caching | Stable identities and prefix text feed Codex caching; reported usage maps back to Anthropic usage | Anthropic cache markers/TTLs have no Codex equivalent; cache creation is never invented |
 | Model discovery | `/v1/models?limit=1000` directly reports one configured backend with a compatible alias | Discovery remains client opt-in; selection does not change `CLAUDE_CODEX_MODEL` |
 

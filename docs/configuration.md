@@ -238,9 +238,12 @@ and started/completed/cached/cancelled/error outcomes, without transcript or sum
 tail -f ~/.local/state/claude-codex/proxy.log | rg 'codex_checkpoint|codex_compact'
 ```
 
-Local summary preparation has a four-minute deadline. A native compaction request has one
-four-minute deadline covering preparation and the final response; upstream keepalives do not reset
-it. Failed or incomplete segments abort recovery and cancel outstanding segments. The proxy
+Local summary preparation has a 15-minute deadline. A native compaction request has one
+15-minute deadline covering preparation and the final response; upstream keepalives do not reset
+it. Set `CLAUDE_CODEX_COMPACTION_TIMEOUT` to a positive number of seconds to override
+the deadline (for example, `CLAUDE_CODEX_COMPACTION_TIMEOUT=1800 claude-codex --continue`).
+Invalid, nonpositive, or nonfinite values use the default. Restart the launcher to apply
+a changed timeout; running proxy processes retain their existing settings. Failed or incomplete segments abort recovery and cancel outstanding segments. The proxy
 returns an explicit error instead of forwarding the same oversized inference. Oversized image
 histories and checkpoint summaries or retained format instructions that still exceed the budget
 require a different checkpoint; their contents are not silently dropped. These limits apply to proxy recovery, not

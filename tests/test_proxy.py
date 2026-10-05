@@ -12,7 +12,12 @@ import httpx
 import pytest
 
 from claude_codex.auth import Tokens
-from claude_codex.proxy import _compact_at_tokens, _remote_compact_enabled, create_app
+from claude_codex.proxy import (
+    _compact_at_tokens,
+    _compaction_timeout_seconds,
+    _remote_compact_enabled,
+    create_app,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -47,6 +52,21 @@ def test_compact_at_tokens_preserves_overrides(monkeypatch, value, expected) -> 
     monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", value)
 
     assert _compact_at_tokens() == expected
+
+
+@pytest.mark.parametrize("value", [None, "", "invalid", "0", "-1", "nan", "inf"])
+def test_compaction_timeout_defaults_to_fifteen_minutes(monkeypatch, value) -> None:
+    if value is None:
+        monkeypatch.delenv("CLAUDE_CODEX_COMPACTION_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CODEX_COMPACTION_TIMEOUT", value)
+    assert _compaction_timeout_seconds() == 900.0
+
+
+@pytest.mark.parametrize("value", ["0.05", "240", "1800"])
+def test_compaction_timeout_preserves_positive_override(monkeypatch, value) -> None:
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACTION_TIMEOUT", value)
+    assert _compaction_timeout_seconds() == float(value)
 
 
 def test_remote_compact_is_opt_in(monkeypatch) -> None:

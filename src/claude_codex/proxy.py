@@ -39,7 +39,7 @@ CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
 INSTALLATION_ID_PATH = Path.home() / ".config" / "claude-codex" / "installation_id"
 DEFAULT_COMPACT_AT_TOKENS = 180_000
 COMPACTION_CHUNK_TOKENS = 30_000
-COMPACTION_TIMEOUT_SECONDS = 240.0
+COMPACTION_TIMEOUT_SECONDS = 900.0
 COMPACTION_CONCURRENCY = 4
 CHECKPOINT_CACHE_PATH = Path.home() / ".local/state/claude-codex/checkpoints"
 LOCAL_COMPACTION_RETAINED_USER_TOKENS = 20_000
@@ -54,6 +54,14 @@ LOCAL_SUMMARY_PREFIX = "Context checkpoint summary:"
 # (e.g. during long model reasoning) and time the connection out.
 PING_INTERVAL_SECONDS = 15.0
 UPSTREAM_HEADERS_EVENT = "_proxy.response_headers"
+
+
+def _compaction_timeout_seconds() -> float:
+    try:
+        value = float(os.environ.get("CLAUDE_CODEX_COMPACTION_TIMEOUT", ""))
+    except ValueError:
+        return COMPACTION_TIMEOUT_SECONDS
+    return value if math.isfinite(value) and value > 0 else COMPACTION_TIMEOUT_SECONDS
 
 
 def _resolve_installation_id(path: Path) -> str:
@@ -1014,7 +1022,7 @@ def create_app(
 
         if implementation == "local":
             try:
-                async with asyncio.timeout(COMPACTION_TIMEOUT_SECONDS):
+                async with asyncio.timeout(_compaction_timeout_seconds()):
                     summary = await backend.summarize_history(upstream, identity)
                 replacement_history = _local_replacement_history(upstream["input"], summary)
             except TimeoutError as exc:
@@ -1100,7 +1108,7 @@ def create_app(
         identity = compaction_state.identity
         upstream["client_metadata"] = identity.client_metadata()
         deadline = (
-            asyncio.get_running_loop().time() + COMPACTION_TIMEOUT_SECONDS
+            asyncio.get_running_loop().time() + _compaction_timeout_seconds()
             if identity.request_class == "compaction" else None
         )
         try:

@@ -257,3 +257,181 @@ def test_translates_structured_output_and_strict_function_tools() -> None:
         "strict": True,
     }
     assert result["tools"][0]["strict"] is True
+
+
+def test_native_web_search_request() -> None:
+    payload = {"messages": [], "tools": [{
+        "type": "web_search_20250305", "name": "web_search",
+        "allowed_domains": ["example.com"],
+        "user_location": {"type": "approximate", "country": "US"},
+    }], "tool_choice": {"type": "tool", "name": "web_search"}}
+    validate_messages_request(payload)
+    request = to_responses_request(payload, model="gpt-5.4", reasoning_effort="medium")
+    assert request["tools"] == [{"type": "web_search", "external_web_access": True,
+                                "filters": {"allowed_domains": ["example.com"]},
+                                "user_location": {"type": "approximate", "country": "US"}}]
+    assert request["tool_choice"] == "required"
+    assert "web_search_call.action.sources" in request["include"]
+
+
+def test_web_search_rejects_unenforceable_options() -> None:
+    import pytest
+
+    for option in ({"max_uses": 1}, {"blocked_domains": ["example.com"]},
+                   {"allowed_domains": "example.com"}, {"user_location": {"type": "exact"}}):
+        with pytest.raises(ValueError):
+            validate_messages_request({"messages": [], "tools": [
+                {"type": "web_search_20250305", "name": "web_search", **option}]})
+    with pytest.raises(ValueError):
+        validate_messages_request({"messages": [], "tools": [
+            {"type": "web_search_20250305", "name": "web_search"}, {"name": "Bash"}],
+            "tool_choice": {"type": "tool", "name": "web_search"}})
+
+
+def test_search_results_citations_and_replay() -> None:
+    for retain in (True, False):
+        stream = AnthropicStream("test", retain_content=retain)
+        search = {"type": "web_search_call", "id": "ws_1", "status": "completed",
+                  "action": {"type": "search", "query": "example",
+                             "sources": [{"type": "url", "url": "https://example.com"}]}}
+        message = {"type": "message", "id": "m_1", "content": [{
+            "type": "output_text", "text": "Answer", "annotations": [{
+                "type": "url_citation", "url": "https://example.com", "title": "Example"}]}]}
+        events = stream.feed("response.output_item.added", {"output_index": 0, "item": search})
+        events += stream.feed("response.output_text.delta", {"output_index": 1, "delta": "Answer"})
+        events += stream.feed("response.completed", {"response": {"output": [search, message]}})
+        starts = [data["content_block"] for name, data in events if name == "content_block_start"]
+        assert starts[0]["type"] == "server_tool_use"
+        assert starts[0]["input"] == {"query": "example"}
+        assert starts[1]["type"] == "web_search_tool_result"
+        assert starts[1]["tool_use_id"] == starts[0]["id"]
+        assert starts[1]["content"] == [{"type": "web_search_result", "url": "https://example.com",
+                                        "title": "Example"}]
+        assert stream.stop_reason == "end_turn"
+        assert "https://example.com" in str(events)
+        if retain:
+            response = stream.response()
+            lowered = to_responses_request({"messages": [{"role": "assistant",
+                "content": response["content"]}]}, model="test", reasoning_effort="medium")
+            assert all(item.get("type") != "function_call" for item in lowered["input"])
+            assert "https://example.com" in str(lowered["input"])
+            assert "example" in str(lowered["input"])
+
+
+def test_multiple_search_sources_are_not_guessed_from_citations() -> None:
+    stream = AnthropicStream("test")
+    items = [{"type": "web_search_call", "id": f"ws_{index}", "status": "completed",
+              "action": {"type": "search", "query": f"query {index}",
+                         "sources": [{"url": f"https://example.com/{index}"}]}}
+             for index in range(2)]
+    items.append({"type": "message", "content": [{"type": "output_text", "text": "answer",
+        "annotations": [{"type": "url_citation", "url": "https://other.com", "title": "Other"},
+                        {"type": "url_citation", "url": "https://example.com/0", "title": "Zero"}]}]})
+    stream.feed("response.completed", {"response": {"output": items}})
+    content = stream.response()["content"]
+    assert content[1]["content"] == [{"type": "web_search_result", "url": "https://example.com/0",
+                                      "title": "Zero"}]
+    assert content[3]["content"] == [{"type": "web_search_result", "url": "https://example.com/1",
+                                      "title": "https://example.com/1"}]
+    assert "https://other.com" in content[-1]["text"]
+
+
+def test_search_empty_failed_and_page_actions() -> None:
+    for status, action in (("completed", {"type": "search", "query": "empty"}),
+                           ("failed", {"type": "search", "query": "bad"}),
+                           ("completed", {"type": "open_page", "url": "https://example.com"}),
+                           ("completed", {"type": "find_in_page", "url": "https://example.com",
+                                          "pattern": "needle"})):
+        stream = AnthropicStream("test")
+        stream.feed("response.completed", {"response": {"output": [{
+            "type": "web_search_call", "id": "ws", "status": status, "action": action}]}})
+        content = stream.response()["content"]
+        if status == "failed":
+            assert content[1]["content"]["error_code"] == "unavailable"
+        else:
+            assert content[1]["content"] == []
+        if action["type"] != "search":
+            assert content[0]["input"] == action
+        assert stream.stop_reason == "end_turn"
+
+
+def test_search_mixed_function_and_late_annotations() -> None:
+    for retain in (True, False):
+        stream = AnthropicStream("test", retain_content=retain)
+        search = {"type": "web_search_call", "id": "ws", "status": "completed",
+                  "action": {"type": "search", "queries": ["one", "two"],
+                             "sources": [{"url": "https://example.com"}]}}
+        tool = {"type": "function_call", "id": "fc", "call_id": "call", "name": "Bash",
+                "arguments": '{"command":"ls"}'}
+        events = stream.feed("response.output_item.added", {"item": search})
+        events += stream.feed("response.output_item.done", {"item": search})
+        events += stream.feed("response.output_text.delta", {"output_index": 1, "delta": "Answer"})
+        events += stream.feed("response.output_text.annotation.added", {"output_index": 1,
+            "annotation": {"type": "url_citation", "url": "https://example.com", "title": "Late"}})
+        events += stream.feed("response.output_item.added", {"output_index": 2, "item": tool})
+        events += stream.feed("response.output_item.done", {"output_index": 2, "item": tool})
+        events += stream.feed("response.completed", {"response": {"output": [search,
+            {"type": "message", "content": [{"type": "output_text", "text": "Answer"}]}, tool]}})
+        starts = [data["content_block"] for name, data in events if name == "content_block_start"]
+        assert sum(block["type"] == "server_tool_use" for block in starts) == 1
+        assert starts[0]["input"] == {"query": "one", "queries": ["one", "two"]}
+        assert starts[1]["content"][0]["title"] == "Late"
+        assert stream.stop_reason == "tool_use"
+        deltas = [data["delta"] for name, data in events if name == "content_block_delta"]
+        assert sum(delta.get("text") == "Answer" for delta in deltas) == 1
+        assert any(delta.get("partial_json") == '{"command":"ls"}' for delta in deltas)
+
+
+def test_search_terminal_failure_does_not_emit_results() -> None:
+    for terminal in ("response.failed", "response.incomplete"):
+        stream = AnthropicStream("test")
+        stream.feed("response.output_item.added", {"item": {"type": "web_search_call", "id": "ws"}})
+        events = stream.feed(terminal, {"response": {"error": {"message": "failed"}}})
+        assert events[0][0] == "error"
+        assert stream.failed
+        assert not stream.blocks
+
+
+def test_search_versions_names_and_duplicate_definitions_rejected() -> None:
+    import pytest
+
+    search = {"type": "web_search_20250305", "name": "web_search"}
+    for tools in ([{**search, "type": "web_search_20260209"}],
+                  [{**search, "name": "other"}], [search, search], [search, {"name": "web_search"}]):
+        with pytest.raises(ValueError):
+            validate_messages_request({"messages": [], "tools": tools})
+
+
+def test_search_with_forced_client_function_keeps_function_choice() -> None:
+    payload = {"messages": [], "tools": [
+        {"type": "web_search_20250305", "name": "web_search"}, {"name": "Bash"}],
+        "tool_choice": {"type": "tool", "name": "Bash", "disable_parallel_tool_use": True}}
+    validate_messages_request(payload)
+    request = to_responses_request(payload, model="test", reasoning_effort="medium")
+    assert request["tool_choice"] == {"type": "function", "name": "Bash"}
+    assert request["parallel_tool_calls"] is False
+
+
+def test_search_after_preamble_and_existing_function_reconciles_terminal() -> None:
+    for retain in (True, False):
+        stream = AnthropicStream("test", retain_content=retain)
+        preamble = {"type": "message", "content": [{"type": "output_text", "text": "Looking"}]}
+        stream.feed("response.output_text.delta", {"output_index": 0, "delta": "Looking"})
+        stream.feed("response.output_item.done", {"output_index": 0, "item": preamble})
+        tool = {"type": "function_call", "call_id": "call", "name": "Read"}
+        stream.feed("response.output_item.added", {"output_index": 1, "item": tool})
+        search = {"type": "web_search_call", "id": "ws", "status": "completed",
+                  "action": {"type": "search", "query": "query"}}
+        stream.feed("response.output_item.added", {"output_index": 2, "item": search})
+        events = stream.feed("response.completed", {"response": {"output": [
+            preamble, {**tool, "arguments": '{"file_path":"x"}'}, search]}})
+        assert not any(data.get("delta", {}).get("text") == "Looking" for _, data in events)
+        assert any(data.get("delta", {}).get("partial_json") == '{"file_path":"x"}' for _, data in events)
+
+
+def test_search_without_terminal_fails_instead_of_empty_success() -> None:
+    stream = AnthropicStream("test")
+    stream.feed("response.output_item.added", {"item": {"type": "web_search_call", "id": "ws"}})
+    events = stream.finish()
+    assert events[0][0] == "error"
+    assert stream.failed

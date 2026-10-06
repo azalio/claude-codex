@@ -147,6 +147,128 @@ async def test_proxy_streams_anthropic_events(monkeypatch) -> None:
     await upstream_client.aclose()
 
 
+@pytest.mark.parametrize("stream", [False, True], ids=["nonstream", "streaming"])
+async def test_proxy_native_web_search_returns_sources_and_citations(stream) -> None:
+    captured: dict = {}
+    query = "example website"
+    text = "See Example."
+    search_item = {
+        "type": "web_search_call",
+        "id": "ws_test",
+        "status": "completed",
+        "action": {
+            "type": "search",
+            "query": query,
+            "sources": [{"type": "url", "url": "https://example.com"}],
+        },
+    }
+    message_item = {
+        "type": "message",
+        "id": "msg_test",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{
+            "type": "output_text",
+            "text": text,
+            "annotations": [{
+                "type": "url_citation",
+                "start_index": 4,
+                "end_index": 11,
+                "url": "https://example.com",
+                "title": "Example",
+            }],
+        }],
+    }
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        events = [
+            {"type": "response.created", "response": {"id": "resp_test"}},
+            {"type": "response.output_item.done", "output_index": 0, "item": search_item},
+            {"type": "response.output_text.delta", "output_index": 1, "delta": text},
+            {"type": "response.output_item.done", "output_index": 1, "item": message_item},
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_test",
+                    "status": "completed",
+                    "output": [search_item, message_item],
+                    "usage": {"input_tokens": 3, "output_tokens": 1},
+                },
+            },
+        ]
+        content = "".join(
+            f"event: {event['type']}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n"
+            for event in events
+        )
+        return httpx.Response(200, text=content, headers={"content-type": "text/event-stream"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        app = create_app(auth=FakeAuth(), client=upstream_client, endpoint="https://codex.test/responses")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-opus",
+                    "max_tokens": 100,
+                    "stream": stream,
+                    "messages": [{"role": "user", "content": f"Search for {query}"}],
+                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                },
+            )
+
+    assert response.status_code == 200
+    assert captured["body"]["tools"] == [{"type": "web_search", "external_web_access": True}]
+    assert "web_search_call.action.sources" in captured["body"]["include"]
+    if stream:
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines() if line.startswith("data: ")
+        ]
+        assert not any(event["type"] == "error" for event in events)
+        assert events[-1]["type"] == "message_stop"
+        blocks = {}
+        arguments = {}
+        for event in events:
+            if event["type"] == "content_block_start":
+                blocks[event["index"]] = event["content_block"]
+            elif event["type"] == "content_block_delta":
+                index = event["index"]
+                delta = event["delta"]
+                if delta["type"] == "text_delta":
+                    blocks[index]["text"] += delta["text"]
+                elif delta["type"] == "input_json_delta":
+                    arguments[index] = arguments.get(index, "") + delta["partial_json"]
+        for index, value in arguments.items():
+            blocks[index]["input"] = json.loads(value)
+        content = list(blocks.values())
+        stop_reason = next(
+            event["delta"]["stop_reason"] for event in events if event["type"] == "message_delta"
+        )
+    else:
+        body = response.json()
+        content = body["content"]
+        stop_reason = body["stop_reason"]
+
+    tool_use, = [block for block in content if block["type"] == "server_tool_use"]
+    assert tool_use["name"] == "web_search"
+    assert tool_use["input"] == {"query": query}
+    tool_result, = [block for block in content if block["type"] == "web_search_tool_result"]
+    assert tool_result["tool_use_id"] == tool_use["id"]
+    result, = tool_result["content"]
+    assert result["type"] == "web_search_result"
+    assert result["url"] == "https://example.com"
+    assert result["title"] == "Example"
+    assert stop_reason == "end_turn"
+    answer = "".join(block["text"] for block in content if block["type"] == "text")
+    assert "See " in answer
+    assert "Example" in answer
+    assert "](https://example.com)" in answer
+
+
 async def test_proxy_reuses_persistent_installation_id_across_app_lifetimes(tmp_path: Path) -> None:
     installation_id_path = tmp_path / "installation_id"
     installations: list[str] = []
@@ -1061,7 +1183,7 @@ async def test_output_effort_is_translated_unless_backend_override_is_set(
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
         ) as client:
-            body = {"messages": []}
+            body: dict[str, Any] = {"messages": []}
             if effort is not None:
                 body["output_config"] = {"effort": effort}
             response = await client.post("/v1/messages", json=body)
@@ -1243,7 +1365,7 @@ async def test_context_overflow_sse_is_a_nonretryable_invalid_request(stream, ev
     error = {"code": "context_length_exceeded", "message": message, "param": "input"}
 
     def upstream(_: httpx.Request) -> httpx.Response:
-        event = {"type": "response.failed" if event_type == "response.failed" else "error"}
+        event: dict[str, Any] = {"type": "response.failed" if event_type == "response.failed" else "error"}
         if event_type == "response.failed":
             event["response"] = {"error": error}
         elif event_type == "flat_error":
@@ -1316,7 +1438,7 @@ async def test_compaction_checks_current_request_without_prior_large_usage(
                 response = await client.post("/v1/messages", json={"messages": messages})
                 assert response.status_code == 200
                 messages.append({"role": "assistant", "content": "answer"})
-            body = {"messages": messages}
+            body: dict[str, Any] = {"messages": messages}
             if large_field == "messages":
                 messages.append({"role": "user", "content": "x" * 800})
             elif large_field == "system":
@@ -1477,6 +1599,7 @@ async def test_failed_checkpoint_cancels_siblings_without_sending_normal_inferen
             await asyncio.sleep(10)
         finally:
             cancelled.append(True)
+        raise AssertionError("Sibling checkpoint request was not cancelled")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as backend:
         app = create_app(auth=FakeAuth(), client=backend)

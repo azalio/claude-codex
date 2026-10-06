@@ -8,6 +8,7 @@ dependencies = [
   "certifi>=2024.8.30",
   "fastapi>=0.115,<1",
   "httpx>=0.27,<1",
+  "truststore>=0.10,<1",
   "uvicorn>=0.34,<1",
 ]
 

@@ -4,14 +4,16 @@ import os
 import ssl
 
 import certifi
+import truststore
 
 
 def upstream_ssl_context() -> ssl.SSLContext:
-    """Сохраняет публичные CA и добавляет системные; явный выбор CA имеет приоритет."""
+    """Сохраняет публичные CA и системное доверие ОС; явный выбор CA имеет приоритет."""
     if cafile := os.environ.get("SSL_CERT_FILE"):
         return ssl.create_default_context(cafile=cafile)
     if capath := os.environ.get("SSL_CERT_DIR"):
         return ssl.create_default_context(capath=capath)
-    context = ssl.create_default_context(cafile=certifi.where())
+    context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_verify_locations(cafile=certifi.where())
     context.load_default_certs()
     return context

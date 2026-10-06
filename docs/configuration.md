@@ -68,11 +68,13 @@ credential files are never modified.
 
 ## TLS certificates
 
-Upstream HTTPS requests and OAuth token refreshes trust certifi's public CA bundle plus the
-Python/OpenSSL default CA store, including organization certificates installed there. The public
-bundle remains available when Python has no default CA paths. Certificate and hostname
-verification remain enabled. To replace the default trust with a custom CA bundle or OpenSSL
-certificate directory, set `SSL_CERT_FILE` or `SSL_CERT_DIR` (`SSL_CERT_FILE` takes precedence):
+Upstream HTTPS requests and OAuth token refreshes use `truststore` to trust the operating system's
+native certificate store, including macOS Keychain and Windows certificate stores, plus certifi's
+public CA bundle and OpenSSL's default CA paths. Organization certificates trusted by the operating
+system are available to the proxy. The public bundle remains available when Python has no default
+CA paths. Certificate and hostname verification remain enabled. To replace the default trust with
+a custom CA bundle or OpenSSL certificate directory, set `SSL_CERT_FILE` or `SSL_CERT_DIR`
+(`SSL_CERT_FILE` takes precedence):
 
 ```bash
 SSL_CERT_FILE=/path/to/ca-bundle.pem claude-codex
@@ -91,6 +93,13 @@ current repository path, and atomically updates `~/bin/claude-codex`. Reinstalli
 environment rewrites absolute shebangs for every generated command after a repository move. The
 installed command points to a repo-owned shell wrapper rather than a generated virtualenv
 entrypoint. If the repository is moved again, rerun `./install.sh`.
+
+If another installation appears earlier on `PATH`, it can keep launching an older copy even after
+reinstalling. Check `command -v claude-codex` and choose its directory explicitly when installing:
+
+```bash
+CLAUDE_CODEX_BIN_DIR="$HOME/.local/bin" ./install.sh
+```
 
 ## Use
 

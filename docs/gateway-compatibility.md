@@ -65,7 +65,7 @@ image evidence explicitly. See [classifier configuration](configuration.md#auto-
 | System attribution | Launcher pins `CLAUDE_CODE_ATTRIBUTION_HEADER=0` before reshaping system blocks | Direct clients should set the same variable; the proxy does not strip prompt text |
 | Streaming | Text/tool deltas stream as Anthropic SSE, with body-gap pings and final message events | Missing terminal events and malformed SSE are errors, never synthetic success |
 | HTTP errors and control headers | Status, complete error message/details (context overflow gets Claude recovery wording), `x-should-retry`, and open `anthropic-ratelimit-unified-*` family are retained; retry dates become integer seconds | Codex errors need an Anthropic envelope; cookies/hop-by-hop headers are excluded; Anthropic plan limits are never fabricated |
-| Function tools | Names, call IDs, arguments, tool choice, parallel-call policy, and `strict` are translated | Provider tools are rejected; advisor errors retain `Input tag` wording for Claude Code recovery |
+| Function tools | Names, call IDs, arguments, tool choice, parallel-call policy, and `strict` are translated | Other provider tools are rejected; advisor errors retain `Input tag` wording for Claude Code recovery |
 | Tool search | Launcher pins `ENABLE_TOOL_SEARCH=false`; ordinary MCP function tools remain available | `defer_loading`, `tool_reference`, and provider tool-search tools return explicit errors |
 | Effort and thinking | The launcher pins Codex effort to `medium` by default; `CLAUDE_CODEX_REASONING` selects another level | The gateway override wins over client effort, including implicit `max`. Standalone proxy requests without an override honor explicit client effort (`max` maps to `xhigh`) and default to `medium` when omitted; Anthropic thinking budgets/signatures are not forwarded or fabricated |
 | Structured outputs | JSON-schema `output_config.format` maps to Responses `text.format`, with strict validation requested | Other formats and Anthropic task budgets are unsupported |
@@ -77,6 +77,31 @@ New headers in the routing-hint family require no allowlist update. New Anthropi
 still require a Responses translation or explicit rejection: this bridge cannot promise transparent
 support for future Anthropic features. Unsupported known safety, context-management, and provider
 tool contracts are rejected before inference.
+
+## Native Web Search
+
+`web_search_20250305` named `web_search` maps to Codex hosted `web_search` with
+live access and requested source metadata. `allowed_domains` and approximate
+`user_location` (country, region, city, timezone) are forwarded. `max_uses`,
+`blocked_domains`, other options and search versions are rejected before inference.
+Forced named search requires search to be the only tool; mixed automatic search and
+function tools remain supported.
+
+Hosted calls return linked `server_tool_use` / `web_search_tool_result` blocks.
+Results contain actual source URLs and titles (a URL is the fallback display title).
+Citation URLs are also emitted as Markdown source links; original character-range
+attribution is not preserved as Anthropic structured citations. No snippets, encrypted
+content, encrypted citation indexes, or page age are fabricated. This is reduced
+Claude Code compatibility, **not lossless Anthropic Web Search emulation**.
+`open_page` and `find_in_page` actions retain their actual action fields, not invented
+queries. Failed calls return a search error; incomplete responses fail explicitly.
+
+After the first search item, output is buffered until terminal reconciliation so
+results precede the associated answer; proxy pings continue. Ordinary replies retain
+incremental streaming. Search history is replayed as labeled textual evidence,
+including query, sources and errors, never as client function calls or outputs.
+A single call can use citation metadata as results; with multiple calls citations
+only enrich matching per-call source URLs, avoiding guessed attribution.
 
 ## Verification
 

@@ -9,7 +9,7 @@ import json
 import math
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -26,7 +26,7 @@ from starlette.background import BackgroundTask
 from .auth import AuthError, AuthManager, AuthProvider
 from .auxiliary_log import request_payload, write_record
 from .checkpoint import CheckpointCache
-from .classifier import DEFAULT_CLASSIFIER_MODEL, classifier_events, is_classifier_request
+from .classifier import DEFAULT_CLASSIFIER_MODEL, classifier_events, is_classifier_request, verdict_events
 from .models import ModelCatalog
 from .tls import upstream_ssl_context
 from .translate import (
@@ -428,7 +428,7 @@ def _sse_payload(raw: str) -> dict[str, Any]:
     return payload
 
 
-async def _sse(response: httpx.Response) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+async def _sse(response: httpx.Response) -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
     event = "message"
     data: list[str] = []
     async for line in response.aiter_lines():
@@ -483,7 +483,7 @@ class CodexBackend:
         identity: CodexRequestIdentity,
         *,
         request_headers: dict[str, str] | None = None,
-    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    ) -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
         stale_access: str | None = None
         auth_retried = False
         transport_retried = False
@@ -678,7 +678,7 @@ class AuxiliaryResponsesBackend:
     async def events(
         self, payload: dict[str, Any], identity: CodexRequestIdentity, *,
         request_headers: dict[str, str] | None = None,
-    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    ) -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
         del identity, request_headers
         request = request_payload(payload)
         async with self.client.stream(
@@ -733,7 +733,7 @@ class ClassifierChatBackend:
     async def events(
         self, payload: dict[str, Any], identity: CodexRequestIdentity, *,
         request_headers: dict[str, str] | None = None,
-    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    ) -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
         del identity, request_headers
         async with self.client.stream(
             "POST", self.endpoint, json=self.diagnostic_payload(payload), auth=None,
@@ -803,6 +803,9 @@ def create_app(
     branch_counter = 0
     compact_at_tokens = _compact_at_tokens()
     remote_compact_enabled = _remote_compact_enabled()
+    classifier_always_allow = os.environ.get("CLAUDE_CODEX_CLASSIFIER_ALWAYS_ALLOW", "").strip().lower() in {
+        "1", "true", "yes",
+    }
 
     def identity_for(
         session_source: str, session_id: str, agent_id: str, request_class: str
@@ -1138,14 +1141,35 @@ def create_app(
         )
         return identity
 
+    @app.post("/_test/classifier/responses")
+    async def test_classifier_responses():
+        if not classifier_always_allow:
+            return Response(status_code=404)
+        verdict = json.dumps({"severity": 0, "category": None, "rationale": "Synthetic allow for testing"})
+        events = verdict_events(verdict, {
+            "id": "resp_" + uuid.uuid4().hex, "object": "response", "model": "local-test-classifier",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        })
+        return StreamingResponse(
+            iter(encode_sse(name, {"type": name, **data}) for name, data in events),
+            media_type="text/event-stream",
+        )
+
     @app.post("/v1/messages")
     async def messages(request: Request):
         body = await request_body(request)
         if isinstance(body, JSONResponse):
             return body
         requested_model = str(body.get("model") or "claude-codex")
+        synthetic_classifier = (
+            classifier_always_allow and classifier_review
+            and request.headers.get("x-claude-code-request-class") == "auxiliary"
+            and is_classifier_request(to_responses_request(
+                body, model="local-test-classifier", reasoning_effort="low",
+            ))
+        )
         try:
-            selected_model = await catalog.resolve(requested_model)
+            selected_model = None if synthetic_classifier else await catalog.resolve(requested_model)
         except ValueError as exc:
             return invalid_request(str(exc))
         codex_model = selected_model or os.environ.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
@@ -1181,7 +1205,10 @@ def create_app(
             and is_classifier_request(upstream)
         )
         if classifier:
-            codex_model = os.environ.get("CLAUDE_CODEX_CLASSIFIER_MODEL") or DEFAULT_CLASSIFIER_MODEL
+            codex_model = (
+                "local-test-classifier" if synthetic_classifier
+                else os.environ.get("CLAUDE_CODEX_CLASSIFIER_MODEL") or DEFAULT_CLASSIFIER_MODEL
+            )
             reasoning = os.environ.get("CLAUDE_CODEX_CLASSIFIER_REASONING") or "low"
             upstream["model"] = codex_model
             upstream["reasoning"] = {"effort": reasoning}
@@ -1209,6 +1236,10 @@ def create_app(
             ) from exc
 
         async def response_events():
+            local_http = (
+                httpx.AsyncClient(transport=httpx.ASGITransport(app=app), trust_env=False)
+                if synthetic_classifier else None
+            )
             selected_backend = (
                 auxiliary_backend
                 if auxiliary_backend is not None and identity.request_class == "auxiliary"
@@ -1216,7 +1247,11 @@ def create_app(
             )
             if classifier:
                 classifier_endpoint = os.environ.get("CLAUDE_CODEX_CLASSIFIER_ENDPOINT")
-                if classifier_endpoint:
+                if local_http is not None:
+                    selected_backend = AuxiliaryResponsesBackend(
+                        local_http, "http://classifier.local/_test/classifier/responses",
+                    )
+                elif classifier_endpoint:
                     backend_type = (
                         ClassifierChatBackend if classifier_endpoint.rstrip("/").endswith("/chat/completions")
                         else AuxiliaryResponsesBackend
@@ -1295,6 +1330,8 @@ def create_app(
                 try:
                     await source.aclose()
                 finally:
+                    if local_http is not None:
+                        await local_http.aclose()
                     if capture:
                         write_record(
                             metadata, "end", result=result,

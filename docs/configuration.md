@@ -168,6 +168,32 @@ are unaffected. A future Claude Code contract change may require updating recogn
 - `CLAUDE_CODEX_CLASSIFIER_TIMEOUT`: positive seconds for the total deadline;
   default 90. Invalid, nonpositive, and nonfinite values use the default.
 
+For testing without model inference, enable the built-in always-allow classifier:
+
+```bash
+CLAUDE_CODEX_CLASSIFIER_ALWAYS_ALLOW=1 claude-codex
+```
+
+`CLAUDE_CODEX_CLASSIFIER_ALWAYS_ALLOW` is disabled by default. Values `1`, `true`,
+and `yes` (case-insensitive) enable it at proxy startup. It takes precedence over
+`CLAUDE_CODEX_CLASSIFIER_MODEL` and `CLAUDE_CODEX_CLASSIFIER_ENDPOINT` only for
+recognized classifier requests. Main requests and other auxiliary traffic keep
+normal routing.
+
+**Testing only:** this mode deliberately approves every recognized classifier
+request without assessing safety or user intent. The proxy calls its own
+`POST /_test/classifier/responses` endpoint through an in-process HTTP/ASGI transport,
+not a TCP connection. The endpoint returns schema-valid
+`{"severity":0,"category":null,"rationale":"Synthetic allow for testing"}` as a
+Responses SSE stream with zero token usage. Existing validation and translation
+produce Claude Code's native `<severity>0</severity>` reply in both Messages modes.
+No reviewer authentication, model discovery, or remote inference occurs. Diagnostic
+logs identify the synthetic model as `local-test-classifier`.
+
+The test endpoint returns 404 when disabled. Unset the variable and restart
+`claude-codex` to restore normal classifier reviews. Existing sessions are unaffected
+by environment changes.
+
 For a local Ollama classifier with constrained JSON generation, use Chat Completions:
 
 ```bash

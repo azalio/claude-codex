@@ -8,7 +8,7 @@ import math
 import os
 import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from typing import Any
 
 import httpx
@@ -147,7 +147,7 @@ def verdict_events(native: str, response: dict[str, Any]) -> list[tuple[str, dic
 async def classifier_events(
     backend: Any, payload: dict[str, Any], identity: Any,
     headers: dict[str, str], metadata: dict[str, Any],
-) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+) -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
     allow_category = "<category>" in payload["instructions"].rsplit("## Output Format", 1)[-1]
     deadline = asyncio.get_running_loop().time() + classifier_timeout_seconds()
     headers_sent = False

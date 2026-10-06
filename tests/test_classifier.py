@@ -27,6 +27,9 @@ POLICY = (
 
 
 class FakeAuth:
+    def load(self):
+        return Tokens("private-auth", "", int(time.time() * 1000) + 60_000, "private-account", "test")
+
     async def get(self, **kwargs):
         return Tokens("private-auth", "", int(time.time() * 1000) + 60_000, "private-account", "test")
 
@@ -36,6 +39,7 @@ def isolated(monkeypatch, tmp_path):
     for key in [
         "CLAUDE_CODEX_CLASSIFIER_MODEL", "CLAUDE_CODEX_CLASSIFIER_REASONING",
         "CLAUDE_CODEX_CLASSIFIER_ENDPOINT", "CLAUDE_CODEX_CLASSIFIER_TIMEOUT",
+        "CLAUDE_CODEX_CLASSIFIER_ALWAYS_ALLOW",
         "CLAUDE_CODEX_AUXILIARY_ENDPOINT", "CLAUDE_CODEX_AUXILIARY_MODEL",
         "CLAUDE_CODEX_AUXILIARY_REASONING",
     ]:
@@ -71,6 +75,122 @@ async def send(upstream, payload):
             return await client.post(
                 "/v1/messages", headers={"x-claude-code-request-class": "auxiliary"}, json=payload,
             )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("category", [False, True])
+@pytest.mark.parametrize("flag", ["1", "true", "yes"])
+async def test_always_allow_uses_local_schema_without_remote_calls(
+    monkeypatch, capsys, stream, category, flag,
+):
+    monkeypatch.setenv("CLAUDE_CODEX_CLASSIFIER_ALWAYS_ALLOW", flag)
+    monkeypatch.setenv("CLAUDE_CODEX_CLASSIFIER_ENDPOINT", "https://review.example/v1/responses")
+
+    class NoAuth:
+        def load(self):
+            pytest.fail("synthetic classifier must not load credentials")
+
+        async def get(self, **kwargs):
+            pytest.fail("synthetic classifier must not authenticate")
+
+    def upstream(request):
+        pytest.fail("synthetic classifier must not call a remote backend")
+
+    policy = POLICY if category else POLICY.split("For blocks")[0]
+    payload = body(stream, policy)
+    payload["model"] = "claude-codex/test-model"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
+        app = create_app(auth=NoAuth(), client=http)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy",
+        ) as client:
+            response = await client.post(
+                "/v1/messages", json=payload,
+                headers={"x-claude-code-request-class": "auxiliary", "host": "untrusted.example"},
+            )
+    assert response.status_code == 200
+    if stream:
+        events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+        assert "".join(e.get("delta", {}).get("text", "") for e in events) == "<severity>0</severity>"
+        assert events[-1]["type"] == "message_stop"
+    else:
+        result = response.json()
+        assert result["content"] == [{"type": "text", "text": "<severity>0</severity>"}]
+        assert result["model"] == payload["model"]
+        assert result["stop_reason"] == "end_turn"
+        assert result["usage"]["output_tokens"] == 0
+    assert "local-test-classifier" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("flag", [None, "0", "false", "1"])
+async def test_local_classifier_endpoint_schema_and_opt_in(monkeypatch, flag):
+    if flag is not None:
+        monkeypatch.setenv("CLAUDE_CODEX_CLASSIFIER_ALWAYS_ALLOW", flag)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: pytest.fail("remote call"))) as http:
+        app = create_app(client=http)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy",
+        ) as client:
+            response = await client.post("/_test/classifier/responses", json={"stream": True})
+    if flag != "1":
+        assert response.status_code == 404
+        return
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+    verdict = "".join(e.get("delta", "") for e in events if e["type"] == "response.output_text.delta")
+    assert json.loads(verdict) == {
+        "severity": 0, "category": None, "rationale": "Synthetic allow for testing",
+    }
+    assert parse_verdict(verdict, allow_category=False)[0] == "<severity>0</severity>"
+    terminal = events[-1]
+    assert terminal["type"] == "response.completed"
+    assert terminal["response"]["status"] == "completed"
+    assert terminal["response"]["usage"] == {"input_tokens": 0, "output_tokens": 0}
+    assert terminal["response"]["output"][0]["content"][0]["text"] == verdict
+
+
+@pytest.mark.parametrize("flag", [None, "0", "false"])
+async def test_always_allow_disabled_keeps_classifier_backend(monkeypatch, flag):
+    if flag is not None:
+        monkeypatch.setenv("CLAUDE_CODEX_CLASSIFIER_ALWAYS_ALLOW", flag)
+    captured = []
+
+    def upstream(request):
+        captured.append(request)
+        return sse('{"severity":80,"category":null,"rationale":"block"}')
+
+    response = await send(upstream, body())
+    assert response.json()["content"][0]["text"] == "<severity>80</severity>"
+    assert len(captured) == 1
+    assert captured[0].url.host == "chatgpt.com"
+
+
+@pytest.mark.parametrize("request_class,policy,review", [
+    ("main", POLICY, True),
+    ("auxiliary", "Write a session title", True),
+    ("auxiliary", POLICY, False),
+])
+async def test_always_allow_does_not_change_unrelated_routes(monkeypatch, request_class, policy, review):
+    monkeypatch.setenv("CLAUDE_CODEX_CLASSIFIER_ALWAYS_ALLOW", "1")
+    captured = []
+
+    def upstream(request):
+        captured.append(request)
+        return sse("ordinary response")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
+        app = create_app(auth=FakeAuth(), client=http, classifier_review=review)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy",
+        ) as client:
+            response = await client.post(
+                "/v1/messages", json=body(policy=policy),
+                headers={"x-claude-code-request-class": request_class},
+            )
+    assert response.json()["content"][0]["text"] == "ordinary response"
+    assert len(captured) == 1
+    assert captured[0].url.host == "chatgpt.com"
 
 
 @pytest.mark.parametrize("text", [

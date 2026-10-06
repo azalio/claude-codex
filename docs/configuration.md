@@ -32,7 +32,8 @@ function-tool form. Existing permissions, hooks, and persistent settings files r
 
 The proxy supports native session/agent routing, streaming with keep-alive pings, HTTP error and
 retry controls, JSON-schema structured outputs, strict function tools, effort translation, and
-`/v1/models` discovery. The launcher enables discovery by default. Run `/model` to choose from the visible
+`/v1/models` discovery. The launcher fetches discovery on startup and builds a temporary `modelPicker` with
+`replaceBuiltInOptions: true`, replacing the built-in Claude rows. Run `/model` to choose from the visible
 models returned by your ChatGPT subscription catalog. Selection changes the main and subagent
 backend; auxiliary summaries and the auto mode classifier retain their own model settings.
 Claude Code requires discovered IDs to contain `claude` or `anthropic`, so the proxy uses
@@ -43,7 +44,8 @@ Catalog results are cached in memory for five minutes. If discovery fails, the p
 its last successful list, or reports the configured backend when no list has been fetched.
 Unknown catalog aliases are rejected rather than silently routed to the default model.
 The launcher gives discovery 10 seconds; the catalog fetch has an 8-second total timeout.
-Set `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0` to disable discovery, or override
+Set `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0` to disable Claude Code's extra discovery request
+(the launcher still fetches the catalog for its curated picker), or override
 `CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_TIMEOUT_MS` if needed. The catalog compatibility
 version defaults to `0.160.0` and can be changed with
 `CLAUDE_CODEX_CATALOG_CLIENT_VERSION`. Token counts remain character-based estimates.
@@ -250,8 +252,9 @@ CLAUDE_CODEX_COMPACT_AT=180000 claude-codex
 CLAUDE_CODEX_REMOTE_COMPACT=1 claude-codex
 ```
 
-For GPT-6.1 backends, the launcher defaults to `ANTHROPIC_MODEL=claude-opus-5-5`,
-giving Claude Code a conservative 200,000-token client context window. Explicit model identities,
+The launcher defaults to `ANTHROPIC_MODEL=claude-codex/<backend-model>` and pins the Default
+menu choice to that same backend via `ANTHROPIC_DEFAULT_MODEL`. This keeps the model name
+truthful and gives Claude Code a conservative 200,000-token client context window. Explicit model identities,
 a forwarded `--model` option, and an in-session `/model` selection remain user overrides.
 The Codex subscription models endpoint verified on 2026-10-02 reported `context_window=272000`
 and `max_context_window=872000` for `gpt-6.1-sol`. A public catalog's context window is not

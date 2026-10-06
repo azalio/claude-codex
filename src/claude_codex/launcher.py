@@ -18,6 +18,8 @@ from contextlib import contextmanager, suppress
 from io import BufferedReader
 from pathlib import Path
 
+from .models import MODEL_PREFIX
+
 DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
 
 
@@ -67,16 +69,45 @@ def _terminate(proxy: subprocess.Popen, grace: float = 3.0) -> None:
 
 def _configure_context_identity(env: dict[str, str], model: str) -> str | None:
     explicit = env.get("ANTHROPIC_MODEL")
-    if (not explicit or explicit == "claude-opus-5-5") and (
-        model == "gpt-6.1" or model.startswith("gpt-6.1-")
-    ):
-        env["ANTHROPIC_MODEL"] = "claude-opus-5-5"
-        return env["ANTHROPIC_MODEL"]
-    return explicit or None
+    if not explicit or explicit == "claude-opus-5-5":
+        env["ANTHROPIC_MODEL"] = MODEL_PREFIX + model
+    return env["ANTHROPIC_MODEL"]
+
+
+def _picker_settings(port: int, model: str) -> dict:
+    """Подменяет только меню текущего запуска, не постоянные настройки."""
+    options = []
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/models",
+            headers={"Authorization": "Bearer claude-codex-local"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            for entry in json.loads(response.read()).get("data", []):
+                if not isinstance(entry, dict):
+                    continue
+                identifier = entry.get("id")
+                if not isinstance(identifier, str) or not identifier.startswith(MODEL_PREFIX):
+                    continue
+                options.append({
+                    "model": identifier,
+                    "label": entry.get("display_name") or identifier.removeprefix(MODEL_PREFIX),
+                    "description": entry.get("description") or "ChatGPT subscription",
+                })
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    if not options:
+        options = [{
+            "model": MODEL_PREFIX + model, "label": model,
+            "description": "Configured ChatGPT subscription backend; catalog unavailable",
+        }]
+    return {"modelPicker": {"replaceBuiltInOptions": True, "options": options}}
 
 
 @contextmanager
-def _proxy_settings_args(args: list[str], overrides: dict[str, str]) -> Iterator[list[str]]:
+def _proxy_settings_args(
+    args: list[str], overrides: dict[str, str], settings_overrides: dict | None = None,
+) -> Iterator[list[str]]:
     """Хранит объединённые настройки приватно до завершения процесса Claude."""
     args = args.copy()
     settings_index = None
@@ -96,6 +127,7 @@ def _proxy_settings_args(args: list[str], overrides: dict[str, str]) -> Iterator
         settings = json.loads(raw if raw.lstrip().startswith("{") else Path(raw).read_text())
         if not isinstance(settings, dict) or not isinstance(settings.get("env", {}), dict):
             raise ValueError("--settings must contain an object with an optional env object")
+    settings.update(settings_overrides or {})
     settings["env"] = {**settings.get("env", {}), **overrides}
     with tempfile.TemporaryDirectory(prefix="claude-codex-settings-") as directory:
         path = Path(directory) / "settings.json"
@@ -240,7 +272,7 @@ def main() -> None:
         env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header}" if existing else header
         model = env.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
         context_identity = _configure_context_identity(env, model)
-        context_note = f"; Claude context {context_identity}" if context_identity else ""
+        context_note = f"; client model {context_identity}" if context_identity else ""
         print(
             f"Claude Code → Codex subscription ({model}){context_note}; proxy 127.0.0.1:{port}",
             file=sys.stderr,
@@ -248,9 +280,11 @@ def main() -> None:
         overrides["ANTHROPIC_CUSTOM_HEADERS"] = env["ANTHROPIC_CUSTOM_HEADERS"]
         if context_identity:
             overrides["ANTHROPIC_MODEL"] = context_identity
+        overrides["ANTHROPIC_DEFAULT_MODEL"] = MODEL_PREFIX + model
+        env["ANTHROPIC_DEFAULT_MODEL"] = overrides["ANTHROPIC_DEFAULT_MODEL"]
         if env.get("CLAUDE_CODEX_AUXILIARY_ENDPOINT"):
             overrides["CLAUDE_CODEX_AUXILIARY_ENDPOINT"] = env["CLAUDE_CODEX_AUXILIARY_ENDPOINT"]
-        with _proxy_settings_args(sys.argv[1:], overrides) as args:
+        with _proxy_settings_args(sys.argv[1:], overrides, _picker_settings(port, model)) as args:
             result = subprocess.run([claude, *args], env=env)
         raise SystemExit(result.returncode)
     finally:

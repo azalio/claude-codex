@@ -127,3 +127,14 @@ async def test_picker_selection_routes_main_and_preserves_auxiliary_model(monkey
             body["model"] = "claude-codex/codex-auto-review"
             assert (await client.post("/v1/messages", json=body)).status_code == 400
     assert [call["model"] for call in calls] == ["gpt-second", "gpt-second", "gpt-auxiliary"]
+
+
+async def test_configured_backend_remains_usable_when_catalog_is_down(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODEX_MODEL", "gpt-configured")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(503))
+    ) as client:
+        catalog = ModelCatalog(FakeAuth(), client, "https://codex.test/responses")
+        assert await catalog.resolve("claude-codex/gpt-configured") == "gpt-configured"
+        with pytest.raises(ValueError):
+            await catalog.resolve("claude-codex/gpt-other")

@@ -93,6 +93,9 @@ class ModelCatalog:
         if not requested.startswith(MODEL_PREFIX):
             return None
         entries = await self.list()
+        configured = os.environ.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
+        if not entries and requested == MODEL_PREFIX + configured:
+            return configured
         if not any(entry["id"] == requested for entry in entries):
             raise ValueError("Selected model is not in the subscription catalog; restart to refresh")
         return requested.removeprefix(MODEL_PREFIX)

@@ -51,12 +51,12 @@ class Response:
 
 @pytest.mark.parametrize("inherited", [None, "", "claude-opus-5-5"])
 @pytest.mark.parametrize("model", ["gpt-6.1", "gpt-6.1-sol"])
-def test_gpt_6_1_uses_standard_claude_context_identity(inherited: str | None, model: str) -> None:
+def test_default_context_identity_names_actual_backend(inherited: str | None, model: str) -> None:
     env = {} if inherited is None else {"ANTHROPIC_MODEL": inherited}
 
     result = launcher._configure_context_identity(env, model)
 
-    assert result == "claude-opus-5-5"
+    assert result == "claude-codex/" + model
     assert env["ANTHROPIC_MODEL"] == result
 
 
@@ -70,18 +70,18 @@ def test_context_identity_preserves_explicit_model(model: str) -> None:
     assert env["ANTHROPIC_MODEL"] == model
 
 
-def test_other_upstream_models_do_not_set_claude_context_identity() -> None:
+def test_other_upstream_models_use_actual_backend_identity() -> None:
     env: dict[str, str] = {}
 
-    assert launcher._configure_context_identity(env, "gpt-5.4") is None
-    assert "ANTHROPIC_MODEL" not in env
+    assert launcher._configure_context_identity(env, "gpt-5.4") == "claude-codex/gpt-5.4"
+    assert env["ANTHROPIC_MODEL"] == "claude-codex/gpt-5.4"
 
 
-def test_other_upstream_models_preserve_bare_claude_context_identity() -> None:
+def test_old_opus_identity_is_replaced_by_actual_backend() -> None:
     env = {"ANTHROPIC_MODEL": "claude-opus-5-5"}
 
-    assert launcher._configure_context_identity(env, "gpt-5.4") == "claude-opus-5-5"
-    assert env["ANTHROPIC_MODEL"] == "claude-opus-5-5"
+    assert launcher._configure_context_identity(env, "gpt-5.4") == "claude-codex/gpt-5.4"
+    assert env["ANTHROPIC_MODEL"] == "claude-codex/gpt-5.4"
 
 
 def test_log_max_bytes_uses_default_for_invalid_values(monkeypatch) -> None:
@@ -323,6 +323,11 @@ def test_launcher_keeps_settings_private_and_cleans_up(
     monkeypatch.setenv("CLAUDE_CODEX_AUXILIARY_ENDPOINT", "http://localhost:11434/v1/responses")
     monkeypatch.setenv("CLAUDE_CODE_ATTRIBUTION_HEADER", "1")
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", f"X-Private: {header_secret}")
+    monkeypatch.setattr(launcher, "_picker_settings", lambda port, model: {
+        "modelPicker": {"replaceBuiltInOptions": True, "options": [
+            {"model": "claude-codex/" + model, "label": model},
+        ]},
+    })
     captured_paths = []
 
     def run(command, *, env):
@@ -341,6 +346,8 @@ def test_launcher_keeps_settings_private_and_cleans_up(
         assert pinned["MCP_SERVICE_TOKEN"] == secret
         assert merged["hooks"] == settings["hooks"]
         assert merged["permissions"] == settings["permissions"]
+        assert merged["modelPicker"]["replaceBuiltInOptions"] is True
+        assert all("gpt" in row["label"] for row in merged["modelPicker"]["options"])
         assert pinned["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:1234"
         assert pinned["ANTHROPIC_AUTH_TOKEN"] == "claude-codex-local"
         assert pinned["CLAUDE_CODE_USE_VERTEX"] == "0"
@@ -371,3 +378,42 @@ def test_launcher_keeps_settings_private_and_cleans_up(
     assert len(captured_paths) == 1
     assert not captured_paths[0].exists()
     assert json.loads(original.read_text()) == settings
+
+
+def test_picker_settings_replaces_builtin_models_with_catalog(monkeypatch):
+    class CatalogResponse(Response):
+        def read(self):
+            return json.dumps({"data": [
+                {"id": "claude-codex/gpt-first", "display_name": "GPT First"},
+                {"id": "claude-opus-5-5", "display_name": "Misleading fallback"},
+            ]}).encode()
+
+    monkeypatch.setattr(launcher.urllib.request, "urlopen", lambda *args, **kwargs: CatalogResponse(""))
+    picker = launcher._picker_settings(1234, "gpt-first")["modelPicker"]
+    assert picker["replaceBuiltInOptions"] is True
+    assert picker["options"] == [{
+        "model": "claude-codex/gpt-first", "label": "GPT First",
+        "description": "ChatGPT subscription",
+    }]
+
+
+def test_picker_failure_still_hides_anthropic_models(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise OSError("unavailable")
+    monkeypatch.setattr(launcher.urllib.request, "urlopen", unavailable)
+    picker = launcher._picker_settings(1234, "gpt-first")["modelPicker"]
+    assert picker["replaceBuiltInOptions"] is True
+    assert picker["options"][0]["model"] == "claude-codex/gpt-first"
+
+
+def test_picker_overrides_are_temporary_and_preserve_other_settings():
+    original = {"modelPicker": {"options": [{"model": "opus"}]}, "hooks": {}}
+    args = ["--settings", json.dumps(original)]
+    picker = {"modelPicker": {"replaceBuiltInOptions": True, "options": [
+        {"model": "claude-codex/gpt-first", "label": "GPT First"},
+    ]}}
+    with launcher._proxy_settings_args(args, {}, picker) as result:
+        settings = json.loads(Path(result[1]).read_text())
+        assert settings["modelPicker"] == picker["modelPicker"]
+        assert settings["hooks"] == {}
+    assert json.loads(args[1]) == original

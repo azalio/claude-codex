@@ -215,7 +215,8 @@ async def test_proxy_native_web_search_returns_sources_and_citations(stream) -> 
                     "max_tokens": 100,
                     "stream": stream,
                     "messages": [{"role": "user", "content": f"Search for {query}"}],
-                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                    "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+                    "tool_choice": {"type": "tool", "name": "web_search"},
                 },
             )
 

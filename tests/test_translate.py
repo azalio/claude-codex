@@ -261,7 +261,7 @@ def test_translates_structured_output_and_strict_function_tools() -> None:
 
 def test_native_web_search_request() -> None:
     payload = {"messages": [], "tools": [{
-        "type": "web_search_20250305", "name": "web_search",
+        "type": "web_search_20250305", "name": "web_search", "max_uses": 8,
         "allowed_domains": ["example.com"],
         "user_location": {"type": "approximate", "country": "US"},
     }], "tool_choice": {"type": "tool", "name": "web_search"}}
@@ -277,7 +277,7 @@ def test_native_web_search_request() -> None:
 def test_web_search_rejects_unenforceable_options() -> None:
     import pytest
 
-    for option in ({"max_uses": 1}, {"blocked_domains": ["example.com"]},
+    for option in ({"blocked_domains": ["example.com"]},
                    {"allowed_domains": "example.com"}, {"user_location": {"type": "exact"}}):
         with pytest.raises(ValueError):
             validate_messages_request({"messages": [], "tools": [
@@ -435,3 +435,31 @@ def test_search_without_terminal_fails_instead_of_empty_success() -> None:
     events = stream.finish()
     assert events[0][0] == "error"
     assert stream.failed
+
+
+def test_web_search_max_uses_validates_positive_integers() -> None:
+    import pytest
+
+    for value in (True, False, None, "8", 8.0, 0, -1):
+        with pytest.raises(ValueError, match="max_uses must be a positive integer"):
+            validate_messages_request({"messages": [], "tools": [{
+                "type": "web_search_20250305", "name": "web_search", "max_uses": value}]})
+
+
+def test_web_search_max_uses_is_explicitly_unenforced(caplog) -> None:
+    payload = {"messages": [], "tools": [{
+        "type": "web_search_20250305", "name": "web_search", "max_uses": 1}]}
+    validate_messages_request(payload)
+    request = to_responses_request(payload, model="test", reasoning_effort="medium")
+    assert "max_tool_calls" not in request
+    assert "max_uses" not in request["tools"][0]
+    assert "web_search_max_uses_unenforced requested=1" in caplog.text
+    stream = AnthropicStream("test")
+    stream.feed("response.completed", {"response": {"output": [{
+        "type": "web_search_call", "id": f"ws_{index}", "status": "completed",
+        "action": {"type": "search", "query": f"query {index}"}} for index in range(2)]}})
+    assert sum(block["type"] == "server_tool_use" for block in stream.response()["content"]) == 2
+    caplog.clear()
+    payload["tools"][0].pop("max_uses")
+    to_responses_request(payload, model="test", reasoning_effort="medium")
+    assert "web_search_max_uses_unenforced" not in caplog.text

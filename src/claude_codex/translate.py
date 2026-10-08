@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -218,9 +219,13 @@ def validate_messages_request(payload: Any, *, require_messages: bool = True) ->
         if kind == "web_search_20250305":
             if tool.get("name") != "web_search":
                 raise ValueError("web_search_20250305 must be named web_search")
-            unsupported = set(tool) - {"type", "name", "allowed_domains", "user_location", "cache_control"}
+            unsupported = set(tool) - {
+                "type", "name", "allowed_domains", "user_location", "cache_control", "max_uses",
+            }
             if unsupported:
                 raise ValueError("Unsupported web_search options: " + ", ".join(sorted(unsupported)))
+            if "max_uses" in tool and (type(tool["max_uses"]) is not int or tool["max_uses"] <= 0):
+                raise ValueError("web_search max_uses must be a positive integer")
             domains = tool.get("allowed_domains")
             if domains is not None and (
                 not isinstance(domains, list)
@@ -304,6 +309,13 @@ def to_responses_request(
     ]
     search_tools = [tool for tool in payload.get("tools") or [] if tool.get("type") == "web_search_20250305"]
     for tool in search_tools:
+        if "max_uses" in tool:
+            # Codex rejects max_tool_calls; this is an explicit compatibility hint, not a hard cap.
+            logging.getLogger(__name__).warning(
+                "web_search_max_uses_unenforced requested=%s; "
+                "Codex hosted search does not enforce this limit",
+                tool["max_uses"],
+            )
         native: dict[str, Any] = {"type": "web_search", "external_web_access": True}
         if tool.get("allowed_domains") is not None:
             native["filters"] = {"allowed_domains": tool["allowed_domains"]}

@@ -82,7 +82,12 @@ tool contracts are rejected before inference.
 
 `web_search_20250305` named `web_search` maps to Codex hosted `web_search` with
 live access and requested source metadata. `allowed_domains` and approximate
-`user_location` (country, region, city, timezone) are forwarded. `max_uses`,
+`user_location` (country, region, city, timezone) are forwarded.
+`max_uses` accepts positive integers for Claude Code compatibility but is **not
+an enforced search budget**: Codex rejects the Responses `max_tool_calls` parameter.
+The bridge omits this hint upstream and logs `web_search_max_uses_unenforced`;
+more searches than requested can execute and consume subscription quota. It does
+not truncate results or claim that cancellation prevents upstream work.
 `blocked_domains`, other options and search versions are rejected before inference.
 Forced named search requires search to be the only tool; mixed automatic search and
 function tools remain supported.

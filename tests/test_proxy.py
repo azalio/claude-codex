@@ -1619,14 +1619,96 @@ async def test_failed_checkpoint_cancels_siblings_without_sending_normal_inferen
     assert cancelled
 
 
+@pytest.mark.parametrize("request_class", ["compaction", "main"])
 @pytest.mark.parametrize("stream", [False, True])
-async def test_oversized_image_checkpoint_fails_explicitly_before_inference(monkeypatch, stream):
+@pytest.mark.parametrize("image_source", ["url", "base64"])
+@pytest.mark.parametrize("nested", [False, True], ids=["user-image", "tool-result-image"])
+async def test_oversized_image_checkpoint_recovers_without_textualizing_images(
+    monkeypatch, request_class, stream, image_source, nested
+):
     monkeypatch.setattr("claude_codex.proxy.COMPACTION_CHUNK_TOKENS", 512)
-    requests = []
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "1")
+    monkeypatch.delenv("CLAUDE_CODEX_REMOTE_COMPACT", raising=False)
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACTION_MODEL", "checkpoint-test")
+    monkeypatch.setenv("CLAUDE_CODEX_MODEL", "main-test")
+    image_data = "QUJD" * 40_000
+    source = (
+        {"type": "url", "url": "https://example.invalid/image.png"}
+        if image_source == "url"
+        else {"type": "base64", "media_type": "image/png", "data": image_data}
+    )
+    image_url = source["url"] if image_source == "url" else f"data:image/png;base64,{image_data}"
+    expected_image = {"type": "input_image", "image_url": image_url}
+    content = [
+        {"type": "text", "text": "VISUAL_REQUIREMENT: inspect the diagram. " + "x" * 8000},
+        {"type": "image", "source": source},
+    ]
+    messages = []
+    if nested:
+        messages.append({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "call-image", "name": "lookup", "input": {}},
+        ]})
+        content = [{"type": "tool_result", "tool_use_id": "call-image", "content": content}]
+    messages.extend([
+        {"role": "user", "content": content},
+        {"role": "user", "content": "Write a checkpoint preserving all user requirements."},
+    ])
+    checkpoints = []
+    images = []
+    normal = []
+    merge_completed = False
+
+    def text_only(value):
+        if isinstance(value, dict):
+            return {key: text_only(item) for key, item in value.items() if key != "image_url"}
+        if isinstance(value, list):
+            return [text_only(item) for item in value]
+        return value
 
     async def upstream(request):
-        requests.append(request)
-        raise AssertionError("Image data must not be silently converted into a textual checkpoint")
+        nonlocal merge_completed
+        body = json.loads(request.content)
+        if body["model"] == "checkpoint-test":
+            checkpoints.append(body)
+            text_budget = sum(
+                len(json.dumps(text_only(body.get(key, "")), ensure_ascii=False).encode())
+                for key in ("instructions", "input", "tools")
+            )
+            assert text_budget <= 2048
+            for item in body["input"]:
+                for block in item.get("content", []):
+                    if block["type"] == "input_image":
+                        assert block == expected_image
+                        context = "\n".join(
+                            part["text"] for part in item["content"] if part["type"] == "input_text"
+                        )
+                        assert "/input/" in context
+                        if nested:
+                            assert "call-image" in context
+                        else:
+                            assert "user" in context
+                        images.append(block)
+                    elif block["type"] == "input_text":
+                        assert image_data not in block["text"]
+                        assert image_url not in block["text"]
+                        if block["text"].startswith("Checkpoint summaries"):
+                            assert images == [expected_image]
+                            merge_completed = True
+            result = "visual checkpoint"
+        else:
+            assert body["model"] == "main-test"
+            assert merge_completed, "Normal inference started before all visual checkpoints completed"
+            normal.append(body)
+            result = "done"
+        events = [
+            {"type": "response.output_text.delta", "delta": result},
+            {"type": "response.completed", "response": {"usage": {"input_tokens": 100}}},
+        ]
+        return httpx.Response(
+            200, text="".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+            ),
+        )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as backend:
         app = create_app(auth=FakeAuth(), client=backend)
@@ -1634,16 +1716,138 @@ async def test_oversized_image_checkpoint_fails_explicitly_before_inference(monk
             transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy.test"
         ) as client:
             response = await client.post(
-                "/v1/messages", headers={"x-claude-code-request-class": "compaction"},
+                "/v1/messages", headers={"x-claude-code-request-class": request_class},
+                json={"stream": stream, "system": "Preserve visual evidence.", "messages": messages},
+            )
+    assert response.status_code == 200
+    assert "event: error" not in response.text
+    assert "done" in response.text
+    assert len(checkpoints) > 2
+    assert images == [expected_image]
+    assert len(normal) == 1
+    checkpoint_text = json.dumps(text_only(checkpoints), ensure_ascii=False)
+    assert "VISUAL_REQUIREMENT" in checkpoint_text
+    if nested:
+        assert "call-image" in checkpoint_text
+    assert "Context checkpoint summary:\\nvisual checkpoint" in json.dumps(normal[0]["input"])
+
+
+@pytest.mark.parametrize("request_class", ["compaction", "main"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("failure", ["response.failed", "response.incomplete"])
+async def test_failed_image_checkpoint_does_not_commit_replacement_history(
+    monkeypatch, request_class, stream, failure
+):
+    monkeypatch.setattr("claude_codex.proxy.COMPACTION_CHUNK_TOKENS", 512)
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "1")
+    monkeypatch.delenv("CLAUDE_CODEX_REMOTE_COMPACT", raising=False)
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACTION_MODEL", "checkpoint-test")
+    monkeypatch.setenv("CLAUDE_CODEX_MODEL", "main-test")
+    fail_image = True
+    image_attempts = []
+    normal = []
+    image_url = "https://example.invalid/image.png"
+
+    async def upstream(request):
+        body = json.loads(request.content)
+        if body["model"] != "checkpoint-test":
+            assert not fail_image, "Failed checkpoint must not fall through to normal inference"
+            normal.append(body)
+        else:
+            images = [
+                block for item in body["input"] for block in item.get("content", [])
+                if block["type"] == "input_image"
+            ]
+            if images:
+                assert images == [{"type": "input_image", "image_url": image_url}]
+                image_attempts.append(images)
+                if fail_image:
+                    detail = (
+                        {"error": {"code": "context_length_exceeded", "message": "too big"}}
+                        if failure == "response.failed"
+                        else {"incomplete_details": {"reason": "max_output_tokens"}}
+                    )
+                    events = [
+                        {"type": "response.output_text.delta", "delta": "partial visual summary"},
+                        {"type": failure, "response": detail},
+                    ]
+                    return httpx.Response(200, text="".join(
+                        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+                    ))
+        events = [
+            {"type": "response.output_text.delta", "delta": "complete checkpoint"},
+            {"type": "response.completed", "response": {"usage": {"input_tokens": 100}}},
+        ]
+        return httpx.Response(200, text="".join(
+            f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+        ))
+
+    body = {"stream": stream, "messages": [
+        {"role": "user", "content": [
+            {"type": "text", "text": "x" * 8000},
+            {"type": "image", "source": {"type": "url", "url": image_url}},
+        ]},
+        {"role": "user", "content": "Write a checkpoint preserving all user requirements."},
+    ]}
+    headers = {
+        "x-claude-code-session-id": "failed-visual-checkpoint",
+        "x-claude-code-request-class": request_class,
+    }
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as backend:
+        app = create_app(auth=FakeAuth(), client=backend)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy.test"
+        ) as client:
+            failed = await client.post("/v1/messages", headers=headers, json=body)
+            expected = "context_length_exceeded" if failure == "response.failed" else "compaction_incomplete"
+            assert failed.status_code == 400
+            assert failed.json()["error"]["code"] == expected
+            assert failed.headers["x-should-retry"] == "false"
+            assert not normal
+            assert len(image_attempts) == 1
+            fail_image = False
+            recovered = await client.post("/v1/messages", headers=headers, json=body)
+    assert recovered.status_code == 200
+    assert "event: error" not in recovered.text
+    assert len(image_attempts) == 2, "Retry must not reuse a failed or partial image checkpoint"
+    assert len(normal) == 1
+    assert "partial visual summary" not in json.dumps(normal)
+    assert "Context checkpoint summary:\\ncomplete checkpoint" in json.dumps(normal[0]["input"])
+
+
+@pytest.mark.parametrize("request_class", ["compaction", "main"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_image_checkpoint_wire_budget_fails_before_any_inference(monkeypatch, request_class, stream):
+    monkeypatch.setattr("claude_codex.proxy.COMPACTION_CHUNK_TOKENS", 512)
+    monkeypatch.setattr("claude_codex.proxy.COMPACTION_IMAGE_WIRE_BYTES", 4096)
+    monkeypatch.setenv("CLAUDE_CODEX_COMPACT_AT", "1")
+    monkeypatch.delenv("CLAUDE_CODEX_REMOTE_COMPACT", raising=False)
+    requests = []
+
+    async def upstream(request):
+        requests.append(request)
+        raise AssertionError("All image checkpoints must pass preflight before any inference")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as backend:
+        app = create_app(auth=FakeAuth(), client=backend)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://proxy.test"
+        ) as client:
+            response = await client.post(
+                "/v1/messages", headers={"x-claude-code-request-class": request_class},
                 json={"stream": stream, "messages": [{"role": "user", "content": [
                     {"type": "text", "text": "x" * 8000},
                     {"type": "image", "source": {
-                        "type": "url", "url": "https://example.invalid/image.png",
+                        "type": "url", "url": "https://example.invalid/small-image.png",
+                    }},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "QUJD" * 40_000,
                     }},
                 ]}]},
             )
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == "compaction_images"
+    assert response.json()["error"]["code"] == "compaction_image_budget"
+    assert response.headers["x-should-retry"] == "false"
     assert not requests
 
 

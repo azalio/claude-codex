@@ -322,9 +322,17 @@ Large text histories, including native Claude Code `/compact` requests, are summ
 segments through ordinary `/responses`, with up to four segment requests in parallel.
 Internal checkpoint summaries default to `gpt-6-luna` with `low` reasoning. Set
 `CLAUDE_CODEX_COMPACTION_MODEL` to choose another Codex subscription model; this does
-not change normal answers or the auxiliary endpoint. Segment summaries are then merged in order. Each request's serialized
-instructions, input, and tools have a 120,000-byte budget; this is a conservative size bound, not
-an exact tokenizer count. Tool calls, results, instructions, and tool schemas are included in the
+not change normal answers or the auxiliary endpoint. Segment summaries are then merged in order. Text checkpoint requests have a 120,000-byte budget for serialized
+instructions, input, and tools; this is a conservative size bound, not an exact tokenizer count.
+Oversized histories containing screenshots use ordered multimodal checkpoints: each image is
+sent unchanged as an actual `input_image`, with its source path and role/tool-call metadata,
+then its visual summary is merged with the textual evidence. Image bytes are not interpreted as
+text tokens or embedded into transcript text. Image checkpoints carry at most one image and have
+a separate 20 MiB serialized request ceiling (a local safety policy, not a verified Codex limit).
+A single image or its metadata exceeding that ceiling fails explicitly with
+`compaction_image_budget` before checkpoint dispatch. The selected compaction model must accept
+image inputs; upstream vision failures propagate without silently dropping images.
+Visual summaries are lossy and do not retain the original pixels in the replacement context. Tool calls, results, instructions, and tool schemas are included in the
 checkpoint source. The final native compaction request disables tool execution and omits tool
 schemas already covered by the checkpoint. If its original system text still exceeds the budget,
 it uses a compact-only instruction and preserves the last bounded user formatting request.

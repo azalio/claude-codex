@@ -5,6 +5,7 @@ description = "Run Claude Code with a ChatGPT Codex subscription backend"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "anyio>=4,<5",
   "certifi>=2024.8.30",
   "fastapi>=0.115,<1",
   "httpx>=0.27,<1",

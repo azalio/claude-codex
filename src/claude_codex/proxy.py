@@ -9,19 +9,20 @@ import json
 import math
 import os
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncGenerator
+from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from starlette.background import BackgroundTask
+from starlette.types import Receive, Scope, Send
 
 from .auth import AuthError, AuthManager, AuthProvider
 from .auxiliary_log import request_payload, write_record
@@ -540,6 +541,29 @@ async def _sse(response: httpx.Response) -> AsyncGenerator[tuple[str, dict[str, 
             yield str(payload.get("type") or event), payload
 
 
+class _UpstreamStreamingResponse(StreamingResponse):
+    """Own both iterators even if sending headers fails before the body starts."""
+
+    def __init__(
+        self, content: AsyncGenerator[str, None],
+        events: AsyncGenerator[tuple[str, dict[str, Any]], None], *, headers: dict[str, str],
+    ) -> None:
+        super().__init__(content, media_type="text/event-stream", headers=headers)
+        self.events = events
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # BackgroundTask is skipped on send errors. Closing the body first
+            # joins its pump, so events.aclose() cannot race an in-flight anext().
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self.body_iterator.aclose()
+                finally:
+                    await self.events.aclose()
+
+
 class CodexBackend:
     def __init__(self, auth: AuthProvider, client: httpx.AsyncClient, endpoint: str = CODEX_ENDPOINT) -> None:
         self.auth = auth
@@ -757,17 +781,18 @@ class CodexBackend:
     async def summarize(self, payload: dict[str, Any], identity: CodexRequestIdentity) -> str:
         """Собирает текст local compact из потокового Responses-ответа."""
         parts: list[str] = []
-        async for event, data in self.events(payload, identity):
-            if event == "response.output_text.delta" and isinstance(data.get("delta"), str):
-                parts.append(data["delta"])
-            elif event in {"error", "response.failed"}:
-                response = data.get("response")
-                error = data.get("error") or (
-                    response.get("error") if isinstance(response, dict) else data
-                )
-                raise CodexResponseError(error)
-            elif event == "response.incomplete":
-                raise _compaction_failure("compaction_incomplete", "Checkpoint summary was incomplete")
+        async with aclosing(self.events(payload, identity)) as events:
+            async for event, data in events:
+                if event == "response.output_text.delta" and isinstance(data.get("delta"), str):
+                    parts.append(data["delta"])
+                elif event in {"error", "response.failed"}:
+                    response = data.get("response")
+                    error = data.get("error") or (
+                        response.get("error") if isinstance(response, dict) else data
+                    )
+                    raise CodexResponseError(error)
+                elif event == "response.incomplete":
+                    raise _compaction_failure("compaction_incomplete", "Checkpoint summary was incomplete")
         summary = "".join(parts).strip()
         if not summary:
             raise RuntimeError("Codex local compact returned no summary")
@@ -1461,7 +1486,7 @@ def create_app(
                 await events.aclose()
                 raise
 
-            async def stream() -> AsyncIterator[str]:
+            async def stream() -> AsyncGenerator[str, None]:
                 translator = AnthropicStream(
                     requested_model,
                     retain_content=False,
@@ -1491,7 +1516,6 @@ def create_app(
                 task = asyncio.create_task(pump())
                 error: Exception | None = None
                 completed = False
-                cancelled = False
                 try:
                     while True:
                         try:
@@ -1513,41 +1537,35 @@ def create_app(
                             break
                         for name, chunk in translated:
                             yield encode_sse(name, chunk)
-                except asyncio.CancelledError:
-                    # Launcher shutdown и disconnect клиента отменяют response task.
-                    # Upstream task очищается ниже; штатное завершение не должно
-                    # превращаться в ASGI traceback.
-                    cancelled = True
                 finally:
-                    task.cancel()
-                    with suppress(BaseException):
-                        await task
-                    await events.aclose()
-                if cancelled:
-                    return
+                    # Starlette cancels this task on disconnect. Shield cleanup
+                    # from that scope until the pump and its response are closed.
+                    with anyio.CancelScope(shield=True):
+                        task.cancel()
+                        try:
+                            with suppress(asyncio.CancelledError):
+                                await task
+                        finally:
+                            await events.aclose()
                 if error is not None:
                     yield encode_sse("error", _stream_error(error))
                 elif completed:
                     for name, chunk in translator.finish():
                         yield encode_sse(name, chunk)
 
-            return StreamingResponse(
-                stream(),
-                media_type="text/event-stream",
-                headers=response_headers,
-                background=BackgroundTask(events.aclose),
-            )
+            return _UpstreamStreamingResponse(stream(), events, headers=response_headers)
 
         translator = AnthropicStream(requested_model)
         response_headers = {}
-        async for event, data in response_events():
-            if event == UPSTREAM_HEADERS_EVENT:
-                response_headers = data
-                continue
-            input_tokens = _reported_input_tokens(event, data)
-            if input_tokens is not None:
-                compaction_state.last_input_tokens = input_tokens
-            translator.feed(event, data)
+        async with aclosing(response_events()) as events:
+            async for event, data in events:
+                if event == UPSTREAM_HEADERS_EVENT:
+                    response_headers = data
+                    continue
+                input_tokens = _reported_input_tokens(event, data)
+                if input_tokens is not None:
+                    compaction_state.last_input_tokens = input_tokens
+                translator.feed(event, data)
         translator.finish()
         return JSONResponse(translator.response(), headers=response_headers)
 

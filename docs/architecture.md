@@ -103,6 +103,23 @@ flags, and an `X-Session-Id` custom header before invoking `claude`.
 1. `AnthropicStream` translates text and function-call deltas back into Anthropic SSE events.
 1. When Claude Code exits, the launcher terminates the proxy process group and closes the proxy log.
 
+### Streaming resource ownership
+
+The streaming response owns both the downstream body iterator and the upstream event iterator.
+Its `finally` block closes them even when sending response headers or a body chunk fails. On
+client disconnect, cancellation-shielded cleanup cancels and joins the upstream reader before
+closing the event iterator; this avoids racing `aclose()` against an active read. Non-streaming
+translation and checkpoint summaries explicitly close their event iterators on early errors.
+The shared HTTP client remains open for other requests.
+
+`tests/test_stream_cleanup.py` exercises these paths against a loopback TCP upstream and a
+bounded HTTPX pool, including ASGI disconnects, cancellation, upstream EOF/read timeout,
+translation/checkpoint errors, and repeated parallel disconnect batches. A live Uvicorn test
+also closes real downstream TCP streams and verifies recovery after each disconnect. Each completed batch
+must release its pool slots and allow a subsequent request to succeed. These tests reproduce a
+pool-exhaustion mechanism; they do not establish the socket ownership or exact cause of the
+historical incident in issue #10.
+
 ### Authentication
 
 Credential loading order is:

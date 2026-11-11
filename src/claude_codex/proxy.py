@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import aclosing, asynccontextmanager, suppress
@@ -518,10 +519,34 @@ def _sse_payload(raw: str) -> dict[str, Any]:
     return payload
 
 
+async def _sse_lines(response: httpx.Response) -> AsyncGenerator[str, None]:
+    # HTTPX aiter_lines() uses str.splitlines(), which also splits valid JSON
+    # strings at NEL, U+2028 and U+2029. SSE only recognizes CR, LF and CRLF.
+    parts: list[str] = []
+    skip_lf = False
+    async for text in response.aiter_text():
+        if not text:
+            continue
+        if skip_lf and text.startswith("\n"):
+            text = text[1:]
+        skip_lf = text.endswith("\r")
+        start = 0
+        for match in re.finditer(r"\r\n|[\r\n]", text):
+            parts.append(text[start:match.start()])
+            line = "".join(parts)
+            parts.clear()
+            start = match.end()
+            yield line
+        if start < len(text):
+            parts.append(text[start:])
+    if parts:
+        yield "".join(parts)
+
+
 async def _sse(response: httpx.Response) -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
     event = "message"
     data: list[str] = []
-    async for line in response.aiter_lines():
+    async for line in _sse_lines(response):
         if not line:
             if data:
                 raw = "\n".join(data)

@@ -2213,3 +2213,53 @@ async def test_checkpoint_model_override_leaves_main_model_unchanged(monkeypatch
             )
     assert response.status_code == 200
     assert models == [expected, "gpt-6.1-sol"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("content_kind", ["text", "tool"])
+async def test_proxy_preserves_unicode_separators_in_responses(stream, content_kind):
+    value = "left\u0085middle\u2028more\u2029right"
+    events = [{"type": "response.created", "response": {"id": "resp_unicode"}}]
+    if content_kind == "text":
+        events.append({"type": "response.output_text.delta", "output_index": 0, "delta": value})
+    else:
+        events.extend([
+            {"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "function_call", "id": "fc_unicode", "call_id": "call_unicode",
+                "name": "Write", "arguments": "",
+            }},
+            {"type": "response.function_call_arguments.delta", "output_index": 0,
+             "delta": json.dumps({"text": value}, ensure_ascii=False)},
+        ])
+    events.append({"type": "response.completed", "response": {"usage": {"output_tokens": 5}}})
+    wire = "".join(f"data: {json.dumps(event, ensure_ascii=False)}\n\n" for event in events).encode()
+
+    def upstream(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=wire, headers={"content-type": "text/event-stream"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as backend:
+        app = create_app(auth=FakeAuth(), client=backend)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy.test",
+        ) as client:
+            response = await client.post("/v1/messages", json={"messages": [], "stream": stream})
+
+    assert response.status_code == 200, response.text
+    if stream:
+        # SSE separates lines with CR/LF, never Python's Unicode splitlines().
+        received = [json.loads(line[6:]) for line in response.text.split("\n") if line.startswith("data: ")]
+        assert not any(event["type"] == "error" for event in received), received
+        assert received[-1]["type"] == "message_stop"
+        deltas = [event["delta"] for event in received if event["type"] == "content_block_delta"]
+        if content_kind == "text":
+            assert "".join(delta["text"] for delta in deltas) == value
+        else:
+            assert json.loads("".join(delta["partial_json"] for delta in deltas)) == {"text": value}
+    else:
+        content = response.json()["content"]
+        assert len(content) == 1
+        if content_kind == "text":
+            assert content[0]["text"] == value
+        else:
+            assert content[0]["name"] == "Write"
+            assert content[0]["input"] == {"text": value}

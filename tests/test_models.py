@@ -36,7 +36,7 @@ async def test_catalog_uses_subscription_auth_and_filters_hidden_models():
         assert await catalog.list() == entries
     assert len(calls) == 1
     assert calls[0].url.path == "/models"
-    assert calls[0].url.params["client_version"] == "0.160.0"
+    assert calls[0].url.params["client_version"] == "0.170.0"
     assert calls[0].headers["authorization"] == "Bearer access"
     assert calls[0].headers["chatgpt-account-id"] == "acc-123"
     assert [entry["id"] for entry in entries] == [

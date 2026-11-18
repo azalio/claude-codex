@@ -47,7 +47,7 @@ The launcher gives discovery 10 seconds; the catalog fetch has an 8-second total
 Set `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0` to disable Claude Code's extra discovery request
 (the launcher still fetches the catalog for its curated picker), or override
 `CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_TIMEOUT_MS` if needed. The catalog compatibility
-version defaults to `0.160.0` and can be changed with
+version defaults to `0.170.0` and can be changed with
 `CLAUDE_CODEX_CATALOG_CLIENT_VERSION`. Token counts remain character-based estimates.
 
 See the [compatibility matrix](gateway-compatibility.md) for supported behavior and limits,

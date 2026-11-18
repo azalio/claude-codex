@@ -11,7 +11,7 @@ import httpx
 from .auth import AuthError, AuthProvider
 
 MODEL_PREFIX = "claude-codex/"
-CATALOG_CLIENT_VERSION = "0.160.0"
+CATALOG_CLIENT_VERSION = "0.170.0"
 MODEL_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 

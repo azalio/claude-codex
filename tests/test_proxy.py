@@ -133,7 +133,7 @@ async def test_proxy_streams_anthropic_events(monkeypatch) -> None:
     assert captured["thread"]
     assert captured["installation"]
     assert captured["window"]
-    assert captured["body"]["model"] == "gpt-6.1-sol"
+    assert captured["body"]["model"] == "gpt-6.2-sol"
     assert captured["body"]["reasoning"] == {"effort": "medium", "summary": "auto"}
     assert captured["body"]["prompt_cache_key"] == "session-test"
     assert captured["body"]["client_metadata"] == {
@@ -509,7 +509,7 @@ async def test_proxy_compacts_context_and_reuses_replacement_history(monkeypatch
         {"role": "assistant", "content": [{"type": "output_text", "text": "answer one"}]},
         {"role": "user", "content": [{"type": "input_text", "text": "second"}]},
     ]
-    assert compact_inputs[0]["model"] == "gpt-6.1-sol"
+    assert compact_inputs[0]["model"] == "gpt-6.2-sol"
     assert compact_inputs[0]["prompt_cache_key"] == "compact-session"
     assert normal_inputs[2] == usable_replacement_history + [
         {"role": "assistant", "content": [{"type": "output_text", "text": "answer two"}]},

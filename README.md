@@ -42,7 +42,7 @@ claude-codex --continue
 claude-codex -p "Explain this repository"
 ```
 
-The default is **`gpt-6.1-sol` with `medium` reasoning**.
+The default is **`gpt-6.2-sol` with `medium` reasoning**.
 Run `/model` inside a session to choose an available ChatGPT subscription model.
 You can also choose the model or reasoning level when you launch:
 

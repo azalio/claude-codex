@@ -18,7 +18,7 @@ from contextlib import contextmanager, suppress
 from io import BufferedReader
 from pathlib import Path
 
-from .models import MODEL_PREFIX
+from .models import DEFAULT_MODEL, MODEL_PREFIX
 
 DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
 
@@ -270,7 +270,7 @@ def main() -> None:
         header = f"X-Session-Id: {session_id}"
         existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
         env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header}" if existing else header
-        model = env.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
+        model = env.get("CLAUDE_CODEX_MODEL", DEFAULT_MODEL)
         context_identity = _configure_context_identity(env, model)
         context_note = f"; client model {context_identity}" if context_identity else ""
         print(

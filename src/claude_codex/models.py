@@ -10,6 +10,7 @@ import httpx
 
 from .auth import AuthError, AuthProvider
 
+DEFAULT_MODEL = "gpt-6.2-sol"
 MODEL_PREFIX = "claude-codex/"
 CATALOG_CLIENT_VERSION = "0.170.0"
 MODEL_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -93,7 +94,7 @@ class ModelCatalog:
         if not requested.startswith(MODEL_PREFIX):
             return None
         entries = await self.list()
-        configured = os.environ.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
+        configured = os.environ.get("CLAUDE_CODEX_MODEL", DEFAULT_MODEL)
         if not entries and requested == MODEL_PREFIX + configured:
             return configured
         if not any(entry["id"] == requested for entry in entries):

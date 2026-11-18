@@ -29,7 +29,7 @@ from .auth import AuthError, AuthManager, AuthProvider
 from .auxiliary_log import request_payload, write_record
 from .checkpoint import CheckpointCache
 from .classifier import DEFAULT_CLASSIFIER_MODEL, classifier_events, is_classifier_request, verdict_events
-from .models import ModelCatalog
+from .models import DEFAULT_MODEL, ModelCatalog
 from .tls import upstream_ssl_context
 from .translate import (
     AnthropicStream,
@@ -1117,7 +1117,7 @@ def create_app(
 
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:
-        model = os.environ.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
+        model = os.environ.get("CLAUDE_CODEX_MODEL", DEFAULT_MODEL)
         entries = await catalog.list()
         if not entries:
             alias = os.environ.get("ANTHROPIC_MODEL") or "claude-codex"
@@ -1328,7 +1328,7 @@ def create_app(
             selected_model = None if synthetic_classifier else await catalog.resolve(requested_model)
         except ValueError as exc:
             return invalid_request(str(exc))
-        codex_model = selected_model or os.environ.get("CLAUDE_CODEX_MODEL", "gpt-6.1-sol")
+        codex_model = selected_model or os.environ.get("CLAUDE_CODEX_MODEL", DEFAULT_MODEL)
         requested_effort = (body.get("output_config") or {}).get("effort", "medium")
         reasoning = os.environ.get("CLAUDE_CODEX_REASONING") or (
             "xhigh" if requested_effort == "max" else requested_effort

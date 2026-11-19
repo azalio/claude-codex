@@ -25,10 +25,12 @@ Auto mode keeps its client-side classifier checks. Those checks become ordinary 
 requests and use the subscription's normal quota; this bridge does not provide Anthropic's
 no-charge server checks. See [classifier request charges](https://code.claude.com/docs/en/auto-mode-classifier-billing).
 
-Because the bridge converts system blocks to Responses instructions, it also pins
-`CLAUDE_CODE_ATTRIBUTION_HEADER=0` at the client. Gateway hint headers are enabled, experimental
-Anthropic capabilities are disabled, and `ENABLE_TOOL_SEARCH=false` keeps MCP tools in ordinary
-function-tool form. Existing permissions, hooks, and persistent settings files remain untouched.
+The launcher sets `CLAUDE_CODE_ATTRIBUTION_HEADER=0`. For GPT-6.2 Sol and Astra, the proxy sends
+the session's system prompt as the first `developer` message. This keeps it in the cacheable prefix
+when later turns append messages.
+Gateway hint headers are enabled, experimental Anthropic capabilities are disabled, and
+`ENABLE_TOOL_SEARCH=false` keeps MCP tools in ordinary function-tool form. Existing permissions,
+hooks, and persistent settings files remain untouched.
 
 The proxy supports native session/agent routing, streaming with keep-alive pings, HTTP error and
 retry controls, JSON-schema structured outputs, strict function tools, effort translation, and
@@ -47,7 +49,7 @@ The launcher gives discovery 10 seconds; the catalog fetch has an 8-second total
 Set `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0` to disable Claude Code's extra discovery request
 (the launcher still fetches the catalog for its curated picker), or override
 `CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_TIMEOUT_MS` if needed. The catalog compatibility
-version defaults to `0.160.0` and can be changed with
+version defaults to `0.166.0` and can be changed with
 `CLAUDE_CODEX_CATALOG_CLIENT_VERSION`. Token counts remain character-based estimates.
 
 See the [compatibility matrix](gateway-compatibility.md) for supported behavior and limits,
@@ -126,7 +128,7 @@ to apply them. The launcher enables the required gateway hint headers.
 For example, to use the main model and medium effort for auxiliary requests too:
 
 ```bash
-CLAUDE_CODEX_AUXILIARY_MODEL=gpt-6.1-sol CLAUDE_CODEX_AUXILIARY_REASONING=medium claude-codex
+CLAUDE_CODEX_AUXILIARY_MODEL=gpt-6.2-sol CLAUDE_CODEX_AUXILIARY_REASONING=medium claude-codex
 ```
 
 To route auxiliary requests through Ollama instead of ChatGPT, set a complete
@@ -278,14 +280,22 @@ for both stages, latency, protocol failures, and false approvals.
 
 Configuration:
 
+The main backend defaults to `gpt-6.2-sol` with `medium` reasoning. To use GPT-6.2 Astra:
+
 ```bash
-CLAUDE_CODEX_MODEL=gpt-6.1-sol claude-codex
+CLAUDE_CODEX_MODEL=gpt-6.2-astra claude-codex
 CLAUDE_CODEX_REASONING=xhigh claude-codex
 CLAUDE_CODEX_LOG_MAX_BYTES=10485760 claude-codex
 CLAUDE_CODEX_COMPACT_AT=180000 claude-codex
 # Optional experimental native endpoint; local compact is the safe default.
 CLAUDE_CODEX_REMOTE_COMPACT=1 claude-codex
 ```
+
+Both GPT-6.2 models can also be selected through `/model` when listed in your subscription catalog.
+Set `CLAUDE_CODEX_MODEL` to a model in that catalog to use it at startup.
+If the proxy has no visible models in its cached catalog, it accepts the configured model directly.
+GPT-6.2 requires reasoning; use `low` instead of `none` or `minimal`, as described in the
+[official OpenAI documentation](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6.2-astra).
 
 The launcher defaults to `ANTHROPIC_MODEL=claude-codex/<backend-model>` and pins the Default
 menu choice to that same backend via `ANTHROPIC_DEFAULT_MODEL`. This keeps the model name

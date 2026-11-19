@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from claude_codex.translate import (
     AnthropicStream,
     to_responses_request,
@@ -21,8 +23,11 @@ def test_accepts_system_role_message() -> None:
     assert system_items and system_items[0]["content"][0]["text"] == "be brief"
 
 
-def test_lowers_anthropic_tool_loop() -> None:
+@pytest.mark.parametrize("model", ["gpt-5.4", "gpt-6.2-sol", "gpt-6.2-astra"])
+def test_lowers_anthropic_tool_loop(model) -> None:
     payload = {
+        "temperature": 0.5,
+        "top_p": 0.9,
         "system": [{"type": "text", "text": "Be precise", "cache_control": {"type": "ephemeral"}}],
         "messages": [
             {"role": "user", "content": "List files"},
@@ -46,8 +51,13 @@ def test_lowers_anthropic_tool_loop() -> None:
         ],
     }
 
-    result = to_responses_request(payload, model="gpt-5.4", reasoning_effort="medium")
+    result = to_responses_request(payload, model=model, reasoning_effort="medium")
 
+    assert result["model"] == model
+    assert result["reasoning"] == {"effort": "medium", "summary": "auto"}
+    assert "temperature" not in result
+    assert "top_p" not in result
+    # The proxy still needs these instructions for routing and compaction before sending the request.
     assert result["instructions"] == "Be precise"
     assert result["input"][1] == {
         "type": "function_call",

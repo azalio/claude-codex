@@ -21,7 +21,8 @@ def catalog_response():
     ]}
 
 
-async def test_catalog_uses_subscription_auth_and_filters_hidden_models():
+async def test_catalog_uses_subscription_auth_and_filters_hidden_models(monkeypatch):
+    monkeypatch.delenv("CLAUDE_CODEX_CATALOG_CLIENT_VERSION", raising=False)
     calls = []
 
     def upstream(request):
@@ -36,7 +37,8 @@ async def test_catalog_uses_subscription_auth_and_filters_hidden_models():
         assert await catalog.list() == entries
     assert len(calls) == 1
     assert calls[0].url.path == "/models"
-    assert calls[0].url.params["client_version"] == "0.160.0"
+    assert calls[0].url.params["client_version"] == "0.166.0"
+    assert calls[0].headers["user-agent"] == "Codex/0.166.0"
     assert calls[0].headers["authorization"] == "Bearer access"
     assert calls[0].headers["chatgpt-account-id"] == "acc-123"
     assert [entry["id"] for entry in entries] == [
@@ -93,7 +95,9 @@ async def test_catalog_preserves_last_good_list_on_failure(failure):
     assert len(calls) == 2
 
 
-async def test_picker_selection_routes_main_and_preserves_auxiliary_model(monkeypatch):
+@pytest.mark.parametrize("selected_model", ["gpt-second", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra"])
+async def test_picker_selection_routes_main_and_preserves_auxiliary_model(monkeypatch, selected_model):
+    monkeypatch.delenv("CLAUDE_CODEX_CATALOG_CLIENT_VERSION", raising=False)
     monkeypatch.setenv("CLAUDE_CODEX_MODEL", "gpt-default")
     monkeypatch.setenv("CLAUDE_CODEX_AUXILIARY_MODEL", "gpt-auxiliary")
     calls = []
@@ -101,7 +105,13 @@ async def test_picker_selection_routes_main_and_preserves_auxiliary_model(monkey
     def upstream(request):
         if request.method == "GET":
             assert "x-api-key" not in request.headers
-            return httpx.Response(200, json=catalog_response())
+            catalog = catalog_response()
+            catalog["models"].append({"slug": "gpt-6.1-sol", "visibility": "list"})
+            if request.url.params["client_version"] == "0.166.0":
+                catalog["models"].extend(
+                    {"slug": slug, "visibility": "list"} for slug in ("gpt-6.2-sol", "gpt-6.2-astra")
+                )
+            return httpx.Response(200, json=catalog)
         calls.append(json.loads(request.content))
         return httpx.Response(200, text=(
             'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
@@ -115,8 +125,8 @@ async def test_picker_selection_routes_main_and_preserves_auxiliary_model(monkey
             transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
         ) as client:
             models = await client.get("/v1/models", headers={"x-api-key": "local-secret"})
-            assert len(models.json()["data"]) == 2
-            body = {"model": "claude-codex/gpt-second", "max_tokens": 100,
+            assert "claude-codex/" + selected_model in {entry["id"] for entry in models.json()["data"]}
+            body = {"model": "claude-codex/" + selected_model, "max_tokens": 100,
                     "messages": [{"role": "user", "content": "hi"}]}
             for request_class in ("main", "subagent", "auxiliary"):
                 response = await client.post(
@@ -126,15 +136,21 @@ async def test_picker_selection_routes_main_and_preserves_auxiliary_model(monkey
                 assert response.status_code == 200
             body["model"] = "claude-codex/codex-auto-review"
             assert (await client.post("/v1/messages", json=body)).status_code == 400
-    assert [call["model"] for call in calls] == ["gpt-second", "gpt-second", "gpt-auxiliary"]
+    assert [call["model"] for call in calls] == [selected_model, selected_model, "gpt-auxiliary"]
 
 
-async def test_configured_backend_remains_usable_when_catalog_is_down(monkeypatch):
-    monkeypatch.setenv("CLAUDE_CODEX_MODEL", "gpt-configured")
+@pytest.mark.parametrize("configured, expected", [
+    (None, "gpt-6.2-sol"), ("gpt-6.2-astra", "gpt-6.2-astra"), ("gpt-configured", "gpt-configured"),
+])
+async def test_configured_backend_remains_usable_when_catalog_is_down(monkeypatch, configured, expected):
+    if configured is None:
+        monkeypatch.delenv("CLAUDE_CODEX_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CODEX_MODEL", configured)
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(503))
     ) as client:
         catalog = ModelCatalog(FakeAuth(), client, "https://codex.test/responses")
-        assert await catalog.resolve("claude-codex/gpt-configured") == "gpt-configured"
+        assert await catalog.resolve("claude-codex/" + expected) == expected
         with pytest.raises(ValueError):
             await catalog.resolve("claude-codex/gpt-other")

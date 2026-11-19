@@ -42,12 +42,12 @@ claude-codex --continue
 claude-codex -p "Explain this repository"
 ```
 
-The default is **`gpt-6.1-sol` with `medium` reasoning**.
+The default is **`gpt-6.2-sol` with `medium` reasoning**.
 Run `/model` inside a session to choose an available ChatGPT subscription model.
 You can also choose the model or reasoning level when you launch:
 
 ```bash
-CLAUDE_CODEX_MODEL=gpt-6.1-sol CLAUDE_CODEX_REASONING=high claude-codex
+CLAUDE_CODEX_MODEL=gpt-6.2-astra CLAUDE_CODEX_REASONING=high claude-codex
 ```
 
 Auto-mode classifier checks use **`codex-auto-review` with `low` reasoning**.

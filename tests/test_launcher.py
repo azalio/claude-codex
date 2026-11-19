@@ -50,7 +50,7 @@ class Response:
 
 
 @pytest.mark.parametrize("inherited", [None, "", "claude-opus-5-5"])
-@pytest.mark.parametrize("model", ["gpt-6.1", "gpt-6.1-sol"])
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra"])
 def test_default_context_identity_names_actual_backend(inherited: str | None, model: str) -> None:
     env = {} if inherited is None else {"ANTHROPIC_MODEL": inherited}
 
@@ -258,6 +258,9 @@ def test_proxy_settings_preserve_arguments_after_separator() -> None:
     ],
 )
 @pytest.mark.parametrize("outcome", ["exit", "error", "interrupt"])
+@pytest.mark.parametrize("configured_model, expected_model", [
+    (None, "gpt-6.2-sol"), ("gpt-6.2-astra", "gpt-6.2-astra"), ("gpt-6.1-sol", "gpt-6.1-sol"),
+])
 def test_launcher_keeps_settings_private_and_cleans_up(
     monkeypatch,
     tmp_path,
@@ -267,6 +270,8 @@ def test_launcher_keeps_settings_private_and_cleans_up(
     auxiliary_model,
     auxiliary_reasoning,
     expected_auxiliary,
+    configured_model,
+    expected_model,
 ) -> None:
     import io
 
@@ -276,6 +281,11 @@ def test_launcher_keeps_settings_private_and_cleans_up(
     listener.getsockname.return_value = ("127.0.0.1", 1234)
     listener.fileno.return_value = 42
     monkeypatch.setattr(launcher, "_listen_socket", lambda _: listener)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    if configured_model is None:
+        monkeypatch.delenv("CLAUDE_CODEX_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CODEX_MODEL", configured_model)
     proxy = Mock()
     proxy.stdout = io.BytesIO()
     if configured is None:
@@ -343,6 +353,8 @@ def test_launcher_keeps_settings_private_and_cleans_up(
         merged = json.loads(private.read_text())
         pinned = merged["env"]
         assert_auxiliary(pinned)
+        assert pinned["ANTHROPIC_MODEL"] == "claude-codex/" + expected_model
+        assert pinned["ANTHROPIC_DEFAULT_MODEL"] == "claude-codex/" + expected_model
         assert pinned["MCP_SERVICE_TOKEN"] == secret
         assert merged["hooks"] == settings["hooks"]
         assert merged["permissions"] == settings["permissions"]

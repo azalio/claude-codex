@@ -297,10 +297,11 @@ If the proxy has no visible models in its cached catalog, it accepts the configu
 GPT-6.2 requires reasoning; use `low` instead of `none` or `minimal`, as described in the
 [official OpenAI documentation](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6.2-astra).
 
-The launcher defaults to `ANTHROPIC_MODEL=claude-codex/<backend-model>` and pins the Default
-menu choice to that same backend via `ANTHROPIC_DEFAULT_MODEL`. This keeps the model name
-truthful and gives Claude Code a conservative 200,000-token client context window. Explicit model identities,
-a forwarded `--model` option, and an in-session `/model` selection remain user overrides.
+The launcher sets `ANTHROPIC_MODEL=claude-codex/<backend-model>` by default and points the
+Default menu option at the same backend through `ANTHROPIC_DEFAULT_MODEL`. It sets
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` to `200000` unless you supply a value. Run `/context` to check
+the window Claude Code uses. You can select another model with `ANTHROPIC_MODEL`,
+`--model`, or `/model`.
 The Codex subscription models endpoint verified on 2026-10-02 reported `context_window=272000`
 and `max_context_window=872000` for `gpt-6.1-sol`. A public catalog's context window is not
 proof of the subscription serving limit; the launcher no longer automatically advertises `[1m]`.

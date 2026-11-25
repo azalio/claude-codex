@@ -258,8 +258,10 @@ def test_proxy_settings_preserve_arguments_after_separator() -> None:
     ],
 )
 @pytest.mark.parametrize("outcome", ["exit", "error", "interrupt"])
-@pytest.mark.parametrize("configured_model, expected_model", [
-    (None, "gpt-6.2-sol"), ("gpt-6.2-astra", "gpt-6.2-astra"), ("gpt-6.1-sol", "gpt-6.1-sol"),
+@pytest.mark.parametrize("configured_model, expected_model, context_window, expected_window", [
+    (None, "gpt-6.2-sol", None, "200000"),
+    ("gpt-6.2-astra", "gpt-6.2-astra", "", "200000"),
+    ("gpt-6.1-sol", "gpt-6.1-sol", "250000", "250000"),
 ])
 def test_launcher_keeps_settings_private_and_cleans_up(
     monkeypatch,
@@ -272,6 +274,8 @@ def test_launcher_keeps_settings_private_and_cleans_up(
     expected_auxiliary,
     configured_model,
     expected_model,
+    context_window,
+    expected_window,
 ) -> None:
     import io
 
@@ -294,6 +298,7 @@ def test_launcher_keeps_settings_private_and_cleans_up(
         monkeypatch.setenv("CLAUDE_CODEX_REASONING", configured)
 
     for key, value in (
+        ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", context_window),
         ("CLAUDE_CODEX_AUXILIARY_MODEL", auxiliary_model),
         ("CLAUDE_CODEX_AUXILIARY_REASONING", auxiliary_reasoning),
     ):
@@ -341,6 +346,7 @@ def test_launcher_keeps_settings_private_and_cleans_up(
     captured_paths = []
 
     def run(command, *, env):
+        assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == expected_window
         assert env["CLAUDE_CODEX_REASONING"] == expected_reasoning
         assert_auxiliary(env)
         assert command[0:2] == ["/bin/claude", "--settings"]

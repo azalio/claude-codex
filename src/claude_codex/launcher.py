@@ -237,6 +237,7 @@ def main() -> None:
     try:
         _wait(port, proxy, log_path, startup_id)
         env = proxy_env.copy()
+        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") or "200000"
         overrides = {
             "CLAUDE_CODEX_REASONING": env["CLAUDE_CODEX_REASONING"],
             "CLAUDE_CODEX_AUXILIARY_MODEL": env["CLAUDE_CODEX_AUXILIARY_MODEL"],
